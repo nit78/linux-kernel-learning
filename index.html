@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>图解 Linux 内核课程 · 目录</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  /* index 专属：作为课程目录首页的微调, 复用全部设计 token */
+  .hero {
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 2rem;
+    margin-bottom: 2.5rem;
+  }
+  .hero .tagline {
+    font-family: var(--sans);
+    font-size: .9rem;
+    color: var(--ink-mute);
+    letter-spacing: .02em;
+  }
+  /* 进度徽章: 直接复用 .lesson-meta .chip 的视觉语言 */
+  .progress-row {
+    font-family: var(--sans);
+    font-size: .82rem;
+    color: var(--ink-mute);
+    margin: 1.2rem 0 0;
+  }
+  .progress-row .chip {
+    display: inline-block;
+    background: var(--rule-soft);
+    padding: .15rem .6rem;
+    border-radius: 10px;
+    margin-right: .4rem;
+  }
+  .progress-row .chip.done {
+    background: #eaf5ea;
+    color: var(--ok);
+  }
+  .progress-bar {
+    height: 6px;
+    background: var(--rule-soft);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: .8rem;
+  }
+  .progress-bar > span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    width: 4%;
+  }
+
+  /* 篇章区块 */
+  section.part {
+    margin: 2.5rem 0;
+  }
+  .part-head {
+    display: flex;
+    align-items: baseline;
+    gap: .8rem;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: .4rem;
+    margin-bottom: 1rem;
+  }
+  .part-head h2 {
+    margin: 0;
+    border: none;
+    padding: 0;
+    font-size: 1.25rem;
+  }
+  .part-head .part-range {
+    font-family: var(--mono);
+    font-size: .82rem;
+    color: var(--ink-mute);
+  }
+  .part-head .part-status {
+    margin-left: auto;
+    font-family: var(--sans);
+    font-size: .75rem;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--ink-mute);
+  }
+  .part-status.active { color: var(--accent); }
+  .part-status.done { color: var(--ok); }
+
+  /* 课程条目: 复用表格行的克制风格 */
+  ul.lessons {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  ul.lessons > li {
+    display: grid;
+    grid-template-columns: 3rem 1fr auto;
+    gap: 1rem;
+    align-items: baseline;
+    padding: .8rem 0;
+    border-bottom: 1px solid var(--rule-soft);
+    font-family: var(--sans);
+    font-size: .95rem;
+  }
+  ul.lessons > li:last-child { border-bottom: none; }
+  ul.lessons .num {
+    font-family: var(--mono);
+    font-size: .85rem;
+    color: var(--ink-mute);
+  }
+  ul.lessons .title a { color: var(--ink); border-bottom: none; }
+  ul.lessons .title a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  ul.lessons .title .topic {
+    color: var(--ink-mute);
+    font-size: .82rem;
+    margin-left: .5rem;
+  }
+  ul.lessons .badge {
+    font-size: .72rem;
+    font-family: var(--sans);
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    padding: .15rem .55rem;
+    border-radius: 10px;
+    background: var(--rule-soft);
+    color: var(--ink-mute);
+  }
+  ul.lessons .badge.done { background: #eaf5ea; color: var(--ok); }
+  ul.lessons .badge.next { background: var(--accent-soft); color: var(--accent); }
+  ul.lessons > li.todo {
+    opacity: .55;
+  }
+  ul.lessons > li.todo .title { color: var(--ink-soft); }
+
+  @media (max-width: 560px) {
+    ul.lessons > li { grid-template-columns: 2.4rem 1fr; }
+    ul.lessons .badge { grid-column: 2; justify-self: start; margin-top: .3rem; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <p class="tagline">基于《图解Linux内核（基于 6.x）》（姜亚华, 2024）· 对应 Linux 6.2</p>
+    <h1>图解 Linux 内核 · 学习课程</h1>
+    <p>
+      从<strong>驱动移植</strong>走向<strong>内核 / BSP 工程师</strong>。
+      每课短小可一次完成:先给最小够用的知识,立刻进入一个能跑起来的动手实验,再用测验巩固。
+      沿用"MCU 思维 ↔ 内核思维"对照,把已有的裸机经验迁移成内核直觉。
+    </p>
+
+    <div class="progress-row">
+      <span class="chip done">已完成 1 课</span>
+      <span class="chip">当前: 知识储备篇</span>
+      <span class="chip">下一课: 中断与上半部</span>
+      <div class="progress-bar"><span></span></div>
+    </div>
+  </header>
+
+
+  <section class="part" id="part-1">
+    <div class="part-head">
+      <h2>第一篇 · 知识储备</h2>
+      <span class="part-range">§1–4</span>
+      <span class="part-status active">进行中</span>
+    </div>
+    <p style="color:var(--ink-soft);margin-top:0;font-size:.95rem;">
+      数据结构 / 中断 / 时间——打通 MCU → 内核的思维转换。本篇是后续每一章的地基。
+    </p>
+
+    <ul class="lessons">
+      <li>
+        <span class="num">0001</span>
+        <span class="title">
+          <a href="lessons/0001-intrusive-list-head.html">list_head:侵入式链表——内核数据结构的基石</a>
+          <span class="topic">§2.1 · container_of · 侵入式 vs 持有式</span>
+        </span>
+        <span class="badge done">已完成</span>
+      </li>
+      <li class="todo">
+        <span class="num">0002</span>
+        <span class="title">hlist 哈希链表与 rbtree 红黑树<span class="topic">§2.1–2.2 · 为何 hlist 省一个指针</span></span>
+        <span class="badge next">下一课</span>
+      </li>
+      <li class="todo">
+        <span class="num">0003</span>
+        <span class="title">中断与上半部:从 IRQ handler 到内核视角<span class="topic">§3 · MCU ISR ↔ Linux top-half</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0004</span>
+        <span class="title">下半部机制:softirq / tasklet / workqueue<span class="topic">§3 · 延迟工作的三种容器</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0005</span>
+        <span class="title">时间与定时器:jiffies / hrtimer<span class="topic">§4 · 周期 vs 高精度</span></span>
+        <span class="badge">待学</span>
+      </li>
+    </ul>
+  </section>
+
+
+  <section class="part" id="part-2">
+    <div class="part-head">
+      <h2>第二篇 · 内存管理</h2>
+      <span class="part-range">§5–9</span>
+      <span class="part-status">待开始</span>
+    </div>
+    <p style="color:var(--ink-soft);margin-top:0;font-size:.95rem;">
+      驱动开发的头号痛点,对本课程价值最高。从页→zone→buddy→slab,到 kmalloc 家族与 page fault。
+    </p>
+    <ul class="lessons">
+      <li class="todo">
+        <span class="num">0006</span>
+        <span class="title">物理内存模型:页、zone、NUMA<span class="topic">§5</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0007</span>
+        <span class="title">伙伴系统 Buddy Allocator<span class="topic">§6</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0008</span>
+        <span class="title">Slab/Slub:kmalloc 的来源<span class="topic">§7 · 驱动高频</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0009</span>
+        <span class="title">虚拟地址与 page fault<span class="topic">§8–9</span></span>
+        <span class="badge">待学</span>
+      </li>
+    </ul>
+  </section>
+
+
+  <section class="part" id="part-3">
+    <div class="part-head">
+      <h2>第三篇 · 文件系统</h2>
+      <span class="part-range">§10–12</span>
+      <span class="part-status">待开始</span>
+    </div>
+    <p style="color:var(--ink-soft);margin-top:0;font-size:.95rem;">
+      VFS 抽象、sysfs/procfs(驱动调试必备)、ext4 磁盘格式。
+    </p>
+    <ul class="lessons">
+      <li class="todo">
+        <span class="num">0010</span>
+        <span class="title">VFS 四对象:superblock/inode/dentry/file<span class="topic">§10</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0011</span>
+        <span class="title">sysfs 与 procfs:驱动的用户态接口<span class="topic">§11 · 驱动调试必备</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0012</span>
+        <span class="title">ext4 磁盘布局与读写路径<span class="topic">§12</span></span>
+        <span class="badge">待学</span>
+      </li>
+    </ul>
+  </section>
+
+
+  <section class="part" id="part-4">
+    <div class="part-head">
+      <h2>第四篇 · 进程管理</h2>
+      <span class="part-range">§13–16</span>
+      <span class="part-status">待开始</span>
+    </div>
+    <p style="color:var(--ink-soft);margin-top:0;font-size:.95rem;">
+      task_struct、调度器(CFS/EEVDF)、IPC、信号——驱动并发与阻塞的底层依据。
+    </p>
+    <ul class="lessons">
+      <li class="todo">
+        <span class="num">0013</span>
+        <span class="title">task_struct 与进程生命周期<span class="topic">§13</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0014</span>
+        <span class="title">调度器:CFS / EEVDF<span class="topic">§14</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0015</span>
+        <span class="title">IPC:管道/共享内存/信号量<span class="topic">§15</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0016</span>
+        <span class="title">信号机制与驱动相关性<span class="topic">§16</span></span>
+        <span class="badge">待学</span>
+      </li>
+    </ul>
+  </section>
+
+
+  <section class="part" id="part-5">
+    <div class="part-head">
+      <h2>第五篇 · 综合应用</h2>
+      <span class="part-range">§17–23</span>
+      <span class="part-status">待开始</span>
+    </div>
+    <p style="color:var(--ink-soft);margin-top:0;font-size:.95rem;">
+      ELF/epoll/Binder、设备驱动模型 + V4L2(回到你熟悉的驱动领域作收束)、KVM、virtio/VFIO。
+    </p>
+    <ul class="lessons">
+      <li class="todo">
+        <span class="num">0017</span>
+        <span class="title">ELF 加载与 epoll<span class="topic">§17–18</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0018</span>
+        <span class="title">设备驱动模型 + V4L2<span class="topic">§19–20 · 收束到驱动</span></span>
+        <span class="badge">待学</span>
+      </li>
+      <li class="todo">
+        <span class="num">0019</span>
+        <span class="title">虚拟化:KVM / virtio / VFIO<span class="topic">§21–23</span></span>
+        <span class="badge">待学</span>
+      </li>
+    </ul>
+  </section>
+
+
+  <hr>
+
+  <h2 id="refs">配套资源</h2>
+  <table>
+    <thead><tr><th>资源</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><a href="RESOURCES.md">资源清单 RESOURCES.md</a></td>
+        <td>主教材、英文经典、官方文档、社区——每条注明"何时取用"</td>
+      </tr>
+      <tr>
+        <td><a href="reference/glossary.html">术语表</a></td>
+        <td>中英对照术语,每个词标注首次出现的课次</td>
+      </tr>
+      <tr>
+        <td><a href="MISSION.md">学习目标 MISSION.md</a></td>
+        <td>本课程的 Why / 成功标准 / 边界</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/nit78/linux-kernel-learning" target="_blank" rel="noopener">GitHub 仓库 ↗</a></td>
+        <td>源码、提交历史、问题追踪</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <aside class="callout">
+    <span class="callout-title">关于进度</span>
+    课程随学习推进<strong>逐课增量发布</strong>。本页进度徽章在每课完成后更新——这是本仓库
+    <a href="COMMIT_CONVENTION.md">提交规范</a>里的一环:每课交付时同步改首页的徽章状态。
+  </aside>
+
+  <p class="lesson-nav">
+    <a href="reference/glossary.html">↑ 术语表</a>
+    <a href="https://github.com/nit78/linux-kernel-learning" target="_blank" rel="noopener">GitHub 仓库 ↗</a>
+  </p>
+
+</div>
+</body>
+</html>
