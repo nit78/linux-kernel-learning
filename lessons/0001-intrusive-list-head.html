@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 1 课 · list_head 侵入式链表</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/quiz.js" defer></script>
+<style>
+  /* 本课专属：内存布局示意 */
+  .memfig {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1.3rem 0;
+    color: var(--ink);
+  }
+  .memfig .hl { color: var(--accent); font-weight: 600; }
+  .memfig .dim { color: var(--ink-mute); }
+  .diagram {
+    text-align: center;
+    overflow-x: auto;
+    margin: 1.4rem 0;
+    padding: .5rem;
+  }
+  .diagram svg { max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="lesson-meta">
+    <span class="chip">第 1 课</span>
+    <span class="chip">知识储备篇 · §2.1</span>
+    <span class="chip">对应 Linux 6.2</span>
+    <a href="../reference/glossary.html">术语表</a>
+  </p>
+
+  <h1>list_head：侵入式链表——内核数据结构的基石</h1>
+
+  <p>
+    你做过蓝牙/WiFi 驱动移植，一定见过代码里满屏的 <code>list_for_each_entry</code> 和 <code>container_of</code>。
+    移植时"照搬能用"，但要说清<em>为什么内核这样组织链表</em>，就是从"移植"到"内核工程师"的第一道坎。
+    这节课打通这道坎。
+  </p>
+
+  <aside class="callout tip">
+    <span class="callout-title">为什么从这一课开始</span>
+    <code>list_head</code> 是后续几乎每一章的地基：进程链表、页的 LRU、VFS 的 <code>inode</code> 链、
+    设备模型里的 <code>device</code>/<code>driver</code>/<code>bus</code> 全靠它串起来。
+    把它吃透，后面读内核源码的门槛会下降一大截。
+  </aside>
+
+
+  <h2 id="mcu-vs-kernel">思维转换：两种链表</h2>
+
+  <p>你熟悉的链表（裸机/MCU 教科书里）长这样：</p>
+
+  <pre><code><span class="com">// MCU 教科书式：节点"持有"数据</span>
+<span class="kw">struct</span> node {
+    <span class="type">int</span>        value;     <span class="com">// ← 数据在这里面</span>
+    <span class="kw">struct</span> node *next;
+};</code></pre>
+
+  <p>而内核的链表节点<strong>不含任何数据</strong>，只有一个"挂钩"：</p>
+
+  <pre><code><span class="com">// include/linux/types.h</span>
+<span class="kw">struct</span> <span class="type">list_head</span> {
+    <span class="kw">struct</span> list_head *next, *prev;
+};</code></pre>
+
+  <p>数据结构反过来"嵌入"这个挂钩。这就是<strong>侵入式链表</strong>（intrusive list）。</p>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>MCU / 教科书链表</h4>
+      <p>链表节点<strong>持有</strong>数据；<code>next</code> 指向下一个含数据的节点。</p>
+      <ul>
+        <li>链表代码绑死某一种数据类型</li>
+        <li>每个数据类型要单独写一遍增删改查</li>
+        <li>一个对象只能在一条链上</li>
+      </ul>
+    </div>
+    <div class="col">
+      <h4>Linux 内核链表</h4>
+      <p>链表节点<strong>不含数据</strong>；数据结构里<strong>嵌入</strong> <code>list_head</code> 成员，<code>next/prev</code> 指向相邻节点的那个成员。</p>
+      <ul>
+        <li>链表代码与数据类型<strong>完全解耦</strong></li>
+        <li>一套 <code>list_*</code> API 服务所有数据类型</li>
+        <li>同一对象嵌入多个 <code>list_head</code> 就能同时挂在多条链上</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>对比内存布局，差别一目了然。假设有 3 个蓝牙设备：</p>
+
+  <div class="memfig"><span class="dim">内核侵入式链表：节点不带数据，数据带节点</span>
+
+  bt_device[0]                bt_device[1]                bt_device[2]
+  ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+  │ name = "BT-A"   │         │ name = "BT-B"   │         │ name = "BT-C"   │
+  │ addr = 0x1122   │         │ addr = 0x3344   │         │ addr = 0x5566   │
+  │ <span class="hl">list ────────────────────→ list ────────────────────→ list ─┐</span>
+  │      ↑ <span class="hl">─────────────────────────────────────────────────</span> │      │
+  └──────│───────────┘         └─────────────────┘         └─────────────────┘      │
+         └───────────────────────────────────────────────────────────────────←──────┘
+                   <span class="dim">（循环：最后一个 next 指回头节点）</span>
+
+  <span class="dim">链表本身只有一个"头"，带头双向循环。</span></div>
+
+
+  <h2 id="container-of">关键魔法：<code>container_of</code></h2>
+
+  <p>
+    侵入式链表带来一个必然问题：遍历时我手上只有 <code>list_head *</code> 指针，
+    怎么拿到"拥有它的那个 <code>bt_device</code>"？答案就是 <code>container_of</code>：
+  </p>
+
+  <pre><code><span class="com">// include/linux/container_of.h （简化版）</span>
+<span class="kw">#define</span> container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))</code></pre>
+
+  <p>原理只有三步，画出来就懂了：</p>
+
+  <div class="memfig">  bt_device 结构体在内存中的样子（成员 <span class="hl">list</span> 在偏移 64 字节处）：
+
+  基址 0x1000                                            0x1040
+  ↓                                                       ↓ <span class="dim">(ptr 指向这里)</span>
+  ┌──────────┬──────────┬─────────┬─────────┬─────────────┐
+  │ name[32] │ addr     │ power   │ state   │ <span class="hl">list (list_head)</span> │
+  └──────────┴──────────┴─────────┴─────────┴─────────────┘
+   ←────────────── offsetof(bt_device, list) = 64 ──────────→
+
+  container_of(ptr, bt_device, list) = (char*)ptr - 64 = 0x1000  <span class="dim">← 宿主基址</span>
+</div>
+
+  <aside class="callout">
+    <span class="callout-title">为什么用 <code>(char *)</code> 强转</span>
+    <code>offsetof</code> 返回的是<strong>字节数</strong>。把 <code>ptr</code> 先转成 <code>char *</code>（按字节运算的指针），
+    减去字节数后，地址算术才正确；再转成宿主类型 <code>type *</code>。这是 C 指针算术的标准技巧。
+  </aside>
+
+
+  <h2 id="api">五个最常用的 API</h2>
+
+  <p>掌握这五个，你就能读懂内核里 80% 的链表代码：</p>
+
+  <table>
+    <thead><tr><th>API</th><th>做什么</th></tr></thead>
+    <tbody>
+      <tr><td><code>INIT_LIST_HEAD(&amp;head)</code></td><td>初始化一个头节点，next/prev 都指向自己（空循环链表）。</td></tr>
+      <tr><td><code>list_add(&amp;new, &amp;head)</code></td><td>把 <code>new</code> 插到 <code>head</code> 之后（头插法）。</td></tr>
+      <tr><td><code>list_del(&amp;entry)</code></td><td>从链表中摘除 <code>entry</code>（注意摘除后要把它的指针置为无效，见 <code>LIST_POISON</code>）。</td></tr>
+      <tr><td><code>list_for_each(pos, &amp;head)</code></td><td>遍历，<code>pos</code> 是 <code>list_head *</code>，你拿到的是节点，不是数据。</td></tr>
+      <tr><td><code>list_for_each_entry(item, &amp;head, member)</code></td><td>遍历并自动用 <code>container_of</code> 取出宿主，<code>item</code> 直接就是 <code>bt_device *</code>。<strong>最常用。</strong></td></tr>
+    </tbody>
+  </table>
+
+
+  <h2 id="lab">动手实验：一个能跑的 <code>.ko</code></h2>
+
+  <p>
+    你的目标是写一个内核模块：定义含 <code>list_head</code> 的"蓝牙设备"结构体，
+    在加载时链起 3 个节点并打印，卸载时清空。加载后用 <code>dmesg</code> 看结果——
+    这就是你移植驱动时每次都见、但从没亲手写过那套链表操作。
+  </p>
+
+  <aside class="callout warn">
+    <span class="callout-title">前提</span>
+    你需要内核头文件和构建能力。在 Ubuntu/Debian 上：<code>sudo apt install build-essential linux-headers-$(uname -r)</code>。
+    QEMU 里同样适用。
+  </aside>
+
+  <p><strong>① 模块源码 <code>bt_list.c</code></strong></p>
+
+  <pre><code><span class="com">// bt_list.c — 第 1 课实验：用 list_head 管理蓝牙设备</span>
+<span class="kw">#include</span> &lt;linux/module.h&gt;
+<span class="kw">#include</span> &lt;linux/kernel.h&gt;
+<span class="kw">#include</span> &lt;linux/list.h&gt;
+<span class="kw">#include</span> &lt;linux/slab.h&gt;
+
+<span class="kw">struct</span> bt_device {
+    <span class="type">char</span>              name[16];
+    <span class="type">u16</span>               addr;        <span class="com">// 模拟蓝牙地址</span>
+    <span class="kw">struct</span> list_head  list;        <span class="com">// ← 嵌入的挂钩</span>
+};
+
+<span class="kw">static</span> LIST_HEAD(bt_devices);          <span class="com">// 声明并初始化链表头</span>
+
+<span class="kw">static</span> <span class="type">int</span> __init bt_list_init(<span class="type">void</span>)
+{
+    <span class="type">int</span> i;
+    <span class="kw">struct</span> bt_device *dev;
+
+    pr_info(<span class="str">"bt_list: 加载\n"</span>);
+
+    <span class="com">// 创建并链入 3 个设备</span>
+    <span class="kw">for</span> (i = 0; i &lt; 3; i++) {
+        dev = kzalloc(<span class="kw">sizeof</span>(*dev), GFP_KERNEL);
+        <span class="kw">if</span> (!dev)
+            <span class="kw">return</span> -ENOMEM;
+
+        scnprintf(dev-&gt;name, <span class="kw">sizeof</span>(dev-&gt;name), <span class="str">"BT-%c"</span>, <span class="str">'A'</span> + i);
+        dev-&gt;addr = 0x1000 * (i + 1);
+
+        <span class="com">// 关键：把 dev-&gt;list 挂到 bt_devices 上</span>
+        INIT_LIST_HEAD(&amp;dev-&gt;list);
+        list_add(&amp;dev-&gt;list, &amp;bt_devices);
+    }
+
+    <span class="com">// 遍历：list_for_each_entry 自动用 container_of 取出宿主</span>
+    pr_info(<span class="str">"bt_list: 当前设备链表:\n"</span>);
+    list_for_each_entry(dev, &amp;bt_devices, list) {
+        pr_info(<span class="str">"  - %s (addr=0x%04x)\n"</span>, dev-&gt;name, dev-&gt;addr);
+    }
+    <span class="kw">return</span> 0;
+}
+
+<span class="kw">static</span> <span class="type">void</span> __exit bt_list_exit(<span class="type">void</span>)
+{
+    <span class="kw">struct</span> bt_device *dev, *tmp;
+
+    <span class="com">// 安全遍历+删除：边遍历边 free 必须用 _safe 版本</span>
+    list_for_each_entry_safe(dev, tmp, &amp;bt_devices, list) {
+        pr_info(<span class="str">"bt_list: 摘除 %s\n"</span>, dev-&gt;name);
+        list_del(&amp;dev-&gt;list);
+        kfree(dev);
+    }
+    pr_info(<span class="str">"bt_list: 卸载\n"</span>);
+}
+
+module_init(bt_list_init);
+module_exit(bt_list_exit);
+MODULE_LICENSE(<span class="str">"GPL"</span>);
+MODULE_AUTHOR(<span class="str">"kernel-student"</span>);
+MODULE_DESCRIPTION(<span class="str">"Lesson 1: intrusive list_head demo"</span>);</code></pre>
+
+  <p><strong>② <code>Makefile</code></strong>（与源码同目录）</p>
+
+  <pre><code>obj-m += bt_list.o
+
+KDIR ?= /lib/modules/$(<span class="kw">shell</span> uname -r)/build
+PWD  := $(<span class="kw">shell</span> pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean</code></pre>
+
+  <p><strong>③ 跑起来</strong></p>
+
+  <ol class="steps">
+    <li>编译：<code>make</code> → 生成 <code>bt_list.ko</code></li>
+    <li>加载：<code>sudo insmod bt_list.ko</code></li>
+    <li>看日志：<code>dmesg | tail</code> —— 应看到 3 个设备被链入并打印</li>
+    <li>卸载：<code>sudo rmmod bt_list</code></li>
+    <li>再看日志：<code>dmesg | tail</code> —— 应看到逐个摘除</li>
+  </ol>
+
+  <aside class="callout tip">
+    <span class="callout-title">预期输出</span>
+    加载时逆序打印（因为用了头插法 list_add）：<code>BT-C → BT-B → BT-A</code>。
+    如果顺序反了，正是你理解 <code>list_add</code> 行为的第一手证据——动手看到它，比读十遍文档都牢。
+  </aside>
+
+
+  <h2 id="check">检验理解</h2>
+
+  <p>做两道题，确认你真的读懂了（不是"看着面熟"）。</p>
+
+  <div class="quiz" data-correct="b" data-explain="container_of 的核心是 (char*)ptr − offsetof(type, member)。它用 offsetof 得到成员在宿主中的字节偏移，再用指针的字节算术回退到宿主基址。与编译期类型、虚拟地址布局、成员对齐特性都无关。">
+    <p class="quiz-q">遍历链表时手上只有 list_head 指针，container_of 是靠什么取回宿主结构体的？</p>
+    <label class="quiz-opt"><input type="radio" name="q1" value="a">编译期类型自动推导</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="b">offsetof 字节偏移反算</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="c">虚拟地址连续布局</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="d">结构体成员对齐特性</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="c" data-explain="侵入式链表的精髓就是节点不持有数据、数据嵌入节点：链表代码与数据类型解耦，一套 list_* API 服务所有类型，且一个对象嵌入多个 list_head 就能同时挂多条链。它会用到 container_of（反算宿主），也能共享遍历代码——但'免去手动管理内存'不是它的设计目的。">
+    <p class="quiz-q">为什么内核要用侵入式链表，而不是数据直接放在节点里？</p>
+    <label class="quiz-opt"><input type="radio" name="q2" value="a">免去手动管理内存</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="b">省去 container_of 调用</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="c">数据类型与链表解耦</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="d">禁止共享遍历代码</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+
+  <h2 id="next">接下来</h2>
+
+  <p>
+    这节课你拿到的不是"知识点"，而是<strong>一把万能钥匙</strong>：从现在起，你读内核源码时遇到
+    <code>list_for_each_entry</code> 不再需要停下来猜它在遍历什么。
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">推荐精读（一份就够）</span>
+    本课对应 <a href="../RESOURCES.md">主教材</a>《图解Linux内核（基于6.x）》§2.1「关系型数据结构」。
+    想要英文对照与动手实验，看 <a href="https://linux-kernel-labs.github.io/" target="_blank" rel="noopener">Linux Kernel Labs</a> 的 Data Structures 章节。
+  </aside>
+
+  <h3>带着这些问题进入下一课（或现在问我）</h3>
+  <ul>
+    <li><strong>hlist（哈希链表）为什么只比 list_head 少一个指针？</strong>——下一个高价值细节。</li>
+    <li><strong>内核里红黑树（rbtree）用在哪？</strong>——它和链表如何分工。</li>
+    <li><strong>为什么内核不直接用 C 标准库或通用链表库？</strong>——这会引出"内核没有 libc"的整条线索。</li>
+  </ul>
+
+  <p class="lesson-nav">
+    <a href="../reference/glossary.html">↑ 术语表</a>
+    <a href="#">第 2 课（待生成）→</a>
+  </p>
+
+  <hr>
+  <p style="font-family:var(--sans);font-size:.85rem;color:var(--ink-mute);">
+    学完这一课后，<strong>回来问任何问题</strong>——比如"list_add 和 list_add_tail 的区别"、
+    "如果我在中断上下文里用 kzalloc 会怎样"、或"我能把同一个 dev 同时挂在两条链上吗"。
+    这些问题会决定下一课怎么设计。
+  </p>
+
+</div>
+</body>
+</html>

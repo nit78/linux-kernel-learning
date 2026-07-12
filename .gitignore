@@ -1,0 +1,21 @@
+# ===== 大文件 / 受版权保护的教材 =====
+# 53MB 的教材 PDF 不纳入版本库, 留在本地即可
+*.pdf
+
+# ===== 编辑器 / IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== ZCode 工具临时产物 =====
+# 会话计划等本地缓存, 不需要跟踪
+.zcode/
+
+# ===== 操作系统杂项 =====
+ehthumbs.db
+$RECYCLE.BIN/

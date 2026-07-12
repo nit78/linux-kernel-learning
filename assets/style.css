@@ -1,0 +1,370 @@
+/* =============================================================================
+   图解 Linux 内核课程 · 共享样式表 (assets/style.css)
+   Tufte 风格：宽留白、衬线正文、等宽代码、可打印。
+   所有 lesson / reference 文件 <link> 本文件即可。
+   组件类前缀约定：
+     .wrap        页面容器（约束宽度、居中）
+     .callout     侧栏/重点提示框
+     .mcu-vs-kernel  "MCU 思维 ↔ 内核思维"对照表
+     .quiz-*      测验组件 (配合 assets/quiz.js)
+     .step        编号步骤
+   ========================================================================== */
+
+:root {
+  --ink:        #1a1a1a;
+  --ink-soft:   #444;
+  --ink-mute:   #777;
+  --rule:       #d9d9d9;
+  --rule-soft:  #ececec;
+  --paper:      #fdfdfb;
+  --accent:     #8a1538;   /* 深酒红：标题/链接点缀，印刷友好 */
+  --accent-soft:#f5e9ec;
+  --code-bg:    #f6f6f3;
+  --code-ink:   #1a1a1a;
+  --comment:    #6a737d;
+  --kw:         #8a1538;
+  --str:        #1b5e20;
+  --type:       #0b5394;
+  --ok:         #1b5e20;
+  --err:        #b00020;
+  --maxw:       760px;     /* 正文宽度，Tufte 派的可读宽度 */
+  --serif:      "Songti SC","Source Han Serif SC","Noto Serif CJK SC","Source Han Serif",Georgia,"Times New Roman",serif;
+  --sans:       -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+  --mono:       "JetBrains Mono","Fira Code","SF Mono",Consolas,"Liberation Mono",Menlo,monospace;
+}
+
+/* ---------- reset / base ---------- */
+*,*::before,*::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.7;
+  color: var(--ink);
+  background: var(--paper);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- layout ---------- */
+.wrap {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 4rem 1.5rem 8rem;
+}
+
+/* ---------- typography ---------- */
+h1,h2,h3,h4 { font-family: var(--sans); font-weight: 600; line-height: 1.25; color: var(--ink); }
+h1 {
+  font-size: 2.1rem;
+  margin: 0 0 .35rem;
+  letter-spacing: -.01em;
+}
+h2 {
+  font-size: 1.45rem;
+  margin: 3rem 0 1rem;
+  padding-bottom: .35rem;
+  border-bottom: 1px solid var(--rule);
+}
+h3 {
+  font-size: 1.15rem;
+  margin: 2rem 0 .6rem;
+  color: var(--accent);
+}
+h4 { font-size: 1rem; margin: 1.4rem 0 .4rem; }
+
+p { margin: 0 0 1.1rem; }
+p + p { text-indent: 0; }
+
+a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; transition: border-color .15s; }
+a:hover { border-bottom-color: var(--accent); }
+
+strong { font-weight: 600; }
+em { font-style: italic; }
+
+small { font-size: .85rem; color: var(--ink-mute); }
+
+/* ---------- code ---------- */
+code, pre, kbd, samp { font-family: var(--mono); font-size: .9em; }
+code {
+  background: var(--code-bg);
+  color: var(--code-ink);
+  padding: .12em .4em;
+  border-radius: 3px;
+  border: 1px solid var(--rule-soft);
+  word-break: break-word;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--rule-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+  line-height: 1.55;
+  font-size: .85rem;
+  margin: 1.2rem 0;
+}
+pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--code-ink);
+}
+/* 极轻量的 C 内核代码高亮（靠 span.kw/.str/.com/.type，非必需） */
+code .kw, .kw  { color: var(--kw); font-weight: 600; }
+code .str,.str { color: var(--str); }
+code .com,.com { color: var(--comment); font-style: italic; }
+code .type,.type{ color: var(--type); }
+
+/* ---------- 列表 ---------- */
+ul,ol { padding-left: 1.4rem; margin: 0 0 1.1rem; }
+li { margin: .3rem 0; }
+li > p { margin: .2rem 0; }
+
+/* ---------- 引用 ---------- */
+blockquote {
+  margin: 1.3rem 0;
+  padding: .2rem 1.2rem;
+  border-left: 3px solid var(--accent);
+  color: var(--ink-soft);
+  font-style: italic;
+}
+
+/* ---------- 表格 ---------- */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1.3rem 0;
+  font-size: .92rem;
+  font-family: var(--sans);
+}
+th,td {
+  text-align: left;
+  padding: .6rem .8rem;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+th { font-weight: 600; color: var(--ink); background: var(--rule-soft); }
+tr:last-child td { border-bottom: none; }
+
+/* ---------- 水平线 ---------- */
+hr {
+  border: none;
+  border-top: 1px solid var(--rule);
+  margin: 2.5rem 0;
+}
+
+/* =============================================================================
+   组件：Callout / 重点提示框
+   <aside class="callout"> 或 <aside class="callout warn">
+   ========================================================================== */
+.callout {
+  margin: 1.5rem 0;
+  padding: 1rem 1.2rem;
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 3px;
+  font-size: .95rem;
+}
+.callout p:first-child { margin-top: 0; }
+.callout p:last-child { margin-bottom: 0; }
+.callout.warn { background: #fff4e5; border-left-color: #b36b00; }
+.callout.tip  { background: #eaf5ea; border-left-color: var(--ok); }
+.callout > .callout-title {
+  display: block;
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: .8rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--accent);
+  margin-bottom: .4rem;
+}
+.callout.warn > .callout-title { color: #b36b00; }
+.callout.tip  > .callout-title { color: var(--ok); }
+
+/* =============================================================================
+   组件：MCU 思维 ↔ 内核思维 对照
+   <div class="mcu-vs-kernel">
+     <div class="col"><h4>MCU / 裸机</h4>...</div>
+     <div class="col"><h4>Linux 内核</h4>...</div>
+   </div>
+   ========================================================================== */
+.mcu-vs-kernel {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+.mcu-vs-kernel .col {
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: .9rem 1rem;
+  background: #fff;
+  font-size: .93rem;
+}
+.mcu-vs-kernel .col h4 {
+  margin: 0 0 .5rem;
+  font-size: .8rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--ink-mute);
+}
+.mcu-vs-kernel .col:nth-child(1) h4 { color: #0b5394; }
+.mcu-vs-kernel .col:nth-child(2) h4 { color: var(--accent); }
+.mcu-vs-kernel .col p:last-child { margin-bottom: 0; }
+@media (max-width: 600px) {
+  .mcu-vs-kernel { grid-template-columns: 1fr; }
+}
+
+/* =============================================================================
+   组件：编号步骤
+   <ol class="steps"><li>...</li></ol>
+   ========================================================================== */
+ol.steps { list-style: none; padding-left: 0; counter-reset: step; }
+ol.steps > li {
+  position: relative;
+  padding-left: 2.6rem;
+  margin: .9rem 0;
+}
+ol.steps > li::before {
+  counter-increment: step;
+  content: counter(step);
+  position: absolute;
+  left: 0; top: .1rem;
+  width: 1.9rem; height: 1.9rem;
+  background: var(--accent);
+  color: #fff;
+  font-family: var(--sans);
+  font-size: .85rem;
+  font-weight: 600;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* =============================================================================
+   组件：课程页眉 / 页脚
+   ========================================================================== */
+.lesson-meta {
+  font-family: var(--sans);
+  font-size: .82rem;
+  color: var(--ink-mute);
+  margin-bottom: 2.5rem;
+  padding-bottom: .8rem;
+  border-bottom: 1px solid var(--rule);
+}
+.lesson-meta .chip {
+  display: inline-block;
+  background: var(--rule-soft);
+  padding: .15rem .6rem;
+  border-radius: 10px;
+  margin-right: .4rem;
+}
+.lesson-nav {
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--rule);
+  font-family: var(--sans);
+  font-size: .9rem;
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+.lesson-nav a { color: var(--ink-soft); }
+
+/* =============================================================================
+   组件：Quiz（配合 assets/quiz.js）
+   <div class="quiz" data-correct="b" data-explain="...">
+     <p class="quiz-q">问题</p>
+     <label class="quiz-opt"><input type="radio" name="qN" value="a">...</label>
+     ...
+     <button class="quiz-check">提交</button>
+   </div>
+   ========================================================================== */
+.quiz {
+  margin: 1.8rem 0;
+  padding: 1.3rem 1.4rem;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: #fff;
+}
+.quiz-q {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 1rem;
+  margin: 0 0 1rem;
+  color: var(--ink);
+}
+.quiz-opt {
+  display: block;
+  padding: .55rem .8rem;
+  margin: .35rem 0;
+  border: 1px solid var(--rule-soft);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+  font-family: var(--mono);
+  font-size: .92rem;
+}
+.quiz-opt:hover { background: var(--rule-soft); }
+.quiz-opt input { margin-right: .6rem; transform: translateY(1px); }
+.quiz-opt.selected { background: var(--accent-soft); border-color: var(--accent); }
+.quiz-opt.correct {
+  background: #eaf5ea; border-color: var(--ok);
+}
+.quiz-opt.wrong {
+  background: #fdeaec; border-color: var(--err);
+  text-decoration: line-through;
+  text-decoration-color: var(--err);
+}
+.quiz-opt.locked { cursor: default; }
+.quiz-check {
+  margin-top: .9rem;
+  font-family: var(--sans);
+  font-size: .9rem;
+  padding: .5rem 1.2rem;
+  background: var(--ink);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: opacity .15s;
+}
+.quiz-check:hover { opacity: .85; }
+.quiz-check:disabled { opacity: .4; cursor: default; }
+.quiz-feedback {
+  margin-top: 1rem;
+  padding: .9rem 1rem;
+  border-radius: 4px;
+  font-size: .92rem;
+  display: none;
+}
+.quiz-feedback.show { display: block; }
+.quiz-feedback.ok {
+  background: #eaf5ea;
+  border-left: 3px solid var(--ok);
+}
+.quiz-feedback.no {
+  background: #fdeaec;
+  border-left: 3px solid var(--err);
+}
+.quiz-feedback b { font-family: var(--sans); }
+
+/* =============================================================================
+   打印样式：去掉背景、保留高对比、避免断行
+   ========================================================================== */
+@media print {
+  body { background: #fff; font-size: 11pt; color: #000; }
+  .wrap { max-width: 100%; padding: 1.5rem 0; }
+  a { color: #000; border-bottom: none; }
+  pre, code { background: #fff !important; border-color: #ccc !important; }
+  .callout, .quiz, .mcu-vs-kernel .col { background: #fff; border: 1px solid #999; }
+  .quiz-check, .lesson-nav { display: none; }
+  h2,h3 { page-break-after: avoid; }
+  pre, table, .callout, .mcu-vs-kernel { page-break-inside: avoid; }
+}

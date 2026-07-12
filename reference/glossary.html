@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>术语表 · 图解 Linux 内核课程</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  /* glossary 专属：字母索引 + 词条高亮 */
+  .glossary-intro { color: var(--ink-soft); margin-bottom: 2rem; }
+  dl.gloss { margin: 0; }
+  dl.gloss dt {
+    font-family: var(--sans);
+    font-weight: 600;
+    color: var(--accent);
+    margin-top: 1.6rem;
+    font-size: 1.02rem;
+  }
+  dl.gloss dt .en {
+    color: var(--ink-mute);
+    font-weight: 400;
+    font-size: .9rem;
+    font-family: var(--mono);
+    margin-left: .5rem;
+  }
+  dl.gloss dd { margin: .3rem 0 0; }
+  dl.gloss dd .avoid {
+    color: var(--ink-mute);
+    font-size: .88rem;
+    font-style: italic;
+    margin-top: .3rem;
+    display: block;
+  }
+  dl.gloss dd .ref {
+    color: var(--ink-mute);
+    font-size: .82rem;
+    margin-top: .3rem;
+    font-family: var(--sans);
+  }
+  .group-label {
+    font-family: var(--sans);
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    font-size: .8rem;
+    color: var(--ink-mute);
+    margin: 2.5rem 0 -.8rem;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: .3rem;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>术语表（Glossary）</h1>
+  <p class="lesson-meta">
+    <span class="chip">随课程扩充</span>
+    <span class="chip">已收录 12 条</span>
+    <a href="../lessons/0001-intrusive-list-head.html">← 回到第 1 课</a>
+  </p>
+  <p class="glossary-intro">
+    Linux 内核核心术语。每条只给紧定义（"它是什么"），配英文原词与应避免的同义混淆。
+    课程里出现这些词时一律用本表的词。新术语随课程加入。
+  </p>
+
+  <p class="group-label">运行模型与特权级</p>
+
+  <dl class="gloss">
+    <dt>内核态 <span class="en">kernel mode / kernel space execution</span></dt>
+    <dd>
+      CPU 运行在最高特权级（x86 的 ring 0、ARM 的 EL1），可执行特权指令、访问全部内存与硬件。
+      内核代码与驱动模块都在内核态运行。
+      <span class="avoid">避免叫"特权模式""管理模式"（ARM 的 EL1 才叫 management，易混）。</span>
+    </dd>
+
+    <dt>用户态 <span class="en">user mode</span></dt>
+    <dd>
+      CPU 运行在低特权级（x86 的 ring 3、ARM 的 EL0），受 MMU 与权限隔离约束，
+      不能直接执行特权指令或访问硬件，必须通过系统调用进入内核态。
+      <span class="avoid">避免叫"应用态"。</span>
+    </dd>
+
+    <dt>内核空间 <span class="en">kernel space</span></dt>
+    <dd>
+      虚拟地址空间中专供内核使用的高地址区段（如 x86-64 默认上半部）。
+      所有进程共享同一份内核空间映射。
+      <span class="ref">区分：内核态指"运行特权级"，内核空间指"地址区段"。一个讲 CPU 状态，一个讲地址。</span>
+    </dd>
+
+    <dt>上下文 <span class="en">context</span></dt>
+    <dd>
+      当前代码运行所处的"身份与限制"环境。内核中主要有两类：
+      <strong>进程上下文</strong>（process context，可睡眠、可被抢占、可访问当前进程资源）
+      与 <strong>中断上下文</strong>（interrupt context，不可睡眠、与任何进程无关）。
+      <span class="avoid">避免把"上下文"等同于"寄存器快照"——后者只是上下文切换时保存的具体内容。</span>
+    </dd>
+  </dl>
+
+  <p class="group-label">内核模块与代码组织</p>
+
+  <dl class="gloss">
+    <dt>内核模块 <span class="en">kernel module (.ko)</span></dt>
+    <dd>
+      一段可在运行时用 <code>insmod</code>/<code>modprobe</code> 加载、用 <code>rmmod</code> 卸载的内核代码，
+      编译产物是 <code>.ko</code>（kernel object）。驱动和部分子系统常以模块形式存在，
+      避免把一切编进内核镜像。
+      <span class="avoid">避免叫"驱动文件"——模块不一定都是驱动，驱动也不一定都是模块（可编进 vmlinux）。</span>
+    </dd>
+
+    <dt>vmlinux <span class="en">vmlinux</span></dt>
+    <dd>
+      编译产生的、未压缩的内核可执行镜像（ELF），包含所有静态链接进内核的代码与数据。
+      启动时加载到内存运行的就是它（常被压缩成 bzImage / Image）。
+    </dd>
+
+    <dt>系统调用 <span class="en">system call / syscall</span></dt>
+    <dd>
+      用户态进入内核态的受控入口，是一组编号固定的内核服务函数（如 <code>read</code>、<code>open</code>）。
+      用户程序通过它请求内核代做特权操作。
+    </dd>
+  </dl>
+
+  <p class="group-label">数据结构（第 1–2 课重点）</p>
+
+  <dl class="gloss">
+    <dt>侵入式链表 <span class="en">intrusive / embedded linked list</span></dt>
+    <dd>
+      一种链表组织方式：链表<strong>节点本身不持有数据</strong>，节点（如 <code>struct list_head</code>）
+      被<strong>嵌入到宿主数据结构内部</strong>。同一宿主可同时挂在多条链表上，
+      且链表代码与数据类型解耦。Linux 内核统一采用这种方式。
+      <span class="avoid">避免叫"通用链表""容器链表"——后者特指节点持有数据的相反风格。</span>
+    </dd>
+
+    <dt>struct list_head <span class="en">struct list_head</span></dt>
+    <dd>
+      内核双向循环链表的节点类型，只含两个指针：<code>next</code> 与 <code>prev</code>。
+      它是侵入式链表的载体，被嵌入到几乎所有需要"串起来"的内核结构体中。
+    </dd>
+
+    <dt>container_of <span class="en">container_of</span></dt>
+    <dd>
+      内核头文件提供的一个宏：给定"嵌入成员的指针、宿主类型、成员名"，
+      返回宿主结构体的首地址。原理是用 <code>offsetof</code> 把成员指针反向减去偏移量。
+      它是侵入式链表能从 <code>list_head*</code> 取回宿主的关键。
+    </dd>
+
+    <dt>task_struct <span class="en">task_struct</span></dt>
+    <dd>
+      内核中描述一个"可调度执行单元"（进程或线程，内核不严格区分）的核心结构体，
+      是进程的<strong>进程控制块</strong>。调度、内存、信号、文件等子系统都围绕它组织。
+      <span class="avoid">避免叫"PCB"——内核源码里就叫 task_struct，"PCB"是教科书术语。</span>
+    </dd>
+  </dl>
+
+  <p class="group-label">中断与时间</p>
+
+  <dl class="gloss">
+    <dt>中断服务例程 <span class="en">ISR — Interrupt Service Routine</span></dt>
+    <dd>
+      硬件中断发生时内核调用的、与某中断号绑定的处理函数。运行在中断上下文，
+      必须快速返回、不可睡眠。内核里它通常分"上半部"（硬中断，立即执行）
+      和"下半部"（软中断 / tasklet / 工作队列，延迟执行）。
+      <span class="avoid">避免叫"中断回调"——回调一般指软件注册的异步通知，ISR 特指硬件中断路径。</span>
+    </dd>
+
+    <dt>软中断 <span class="en">softirq</span></dt>
+    <dd>
+      内核提供的"延迟执行"机制，把可在硬中断之外完成的工作推迟处理，
+      仍在中断上下文、不可睡眠。<code>tasklet</code> 与 <code>timer</code> 都建立在软中断之上。
+      <span class="avoid">避免与"信号"（signal，用户态异步通知）混淆——软中断是内核内部机制。</span>
+    </dd>
+
+    <dt>上半部 / 下半部 <span class="en">top half / bottom half</span></dt>
+    <dd>
+      中断处理的分工：上半部 = 硬中断 ISR，只做最紧急的事（如确认中断、拷贝数据）；
+      下半部 = 延迟完成的工作（如协议处理、唤醒进程），由软中断 / tasklet / 工作队列承载。
+      这样能尽快重新打开中断、提高系统响应能力。
+    </dd>
+  </dl>
+
+  <hr>
+  <p class="lesson-nav">
+    <a href="../lessons/0001-intrusive-list-head.html">← 第 1 课：list_head 侵入式链表</a>
+    <a href="../RESOURCES.md">学习资源 →</a>
+  </p>
+
+</div>
+</body>
+</html>
