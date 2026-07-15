@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 2 课 · hlist 哈希链表</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/quiz.js" defer></script>
+<style>
+  .memfig {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1.3rem 0;
+    color: var(--ink);
+  }
+  .memfig .hl { color: var(--accent); font-weight: 600; }
+  .memfig .dim { color: var(--ink-mute); }
+  .memfig .ok { color: var(--ok); }
+  .compare-tbl td:first-child { width: 22%; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="lesson-meta">
+    <span class="chip">第 2 课</span>
+    <span class="chip">知识储备篇 · §2.1 续</span>
+    <span class="chip">对应 Linux 6.2</span>
+    <a href="../reference/glossary.html">术语表</a>
+  </p>
+
+  <h1>hlist：哈希链表——为什么桶头少一个指针</h1>
+
+  <p>
+    第 1 课结尾留了个问题：<em>hlist（哈希链表）为什么只比 list_head 少一个指针？</em>
+    这节课就拆它。你会顺带见识到内核里最巧妙的一次<strong>双指针</strong>用法——
+    这是你在 MCU 裸机代码里几乎不会遇到的思维。
+  </p>
+
+  <aside class="callout tip">
+    <span class="callout-title">先建立直觉</span>
+    内核里凡是"成千上万个、大多为空"的集合（比如哈希表的桶），都舍不得用两个指针做头。
+    hlist 就是给这种场景特制的链表。
+  </aside>
+
+
+  <h2 id="why">问题：哈希表逼出来的设计</h2>
+
+  <p>哈希表的本质是"一个数组 + 每个数组元素挂一条链"：</p>
+
+  <div class="memfig">哈希表 = 桶数组 + 每个桶上挂一条冲突链
+
+  bucket[0] ─→ node ─→ node ─→ <span class="dim">NULL</span>
+  bucket[1] ─→ <span class="dim">NULL（空桶）</span>
+  bucket[2] ─→ node ─→ <span class="dim">NULL</span>
+  bucket[3] ─→ <span class="dim">NULL（空桶）</span>
+     ...
+  bucket[N] ─→ node ─→ node ─→ node ─→ <span class="dim">NULL</span>
+
+  <span class="dim">典型哈希表几千上万个桶，绝大多数是空桶。</span></div>
+
+  <p>
+    如果桶头用 <code>list_head</code>（两个指针），那一个空桶就白占 16 字节（64 位）。
+    几千个桶下来，浪费相当可观。于是内核单独造了 <code>hlist_head</code>，<strong>桶头只留一个指针</strong>：
+  </p>
+
+  <pre><code><span class="com">// include/linux/types.h</span>
+<span class="kw">struct</span> <span class="type">hlist_head</span> {
+    <span class="kw">struct</span> hlist_node *first;    <span class="com">// 只有一个指针：指向桶里第一个节点</span>
+};
+
+<span class="kw">struct</span> <span class="type">hlist_node</span> {
+    <span class="kw">struct</span> hlist_node *next;
+    <span class="kw">struct</span> hlist_node **pprev;   <span class="com">// ← 注意：双指针！不是 *prev</span>
+};</code></pre>
+
+  <p>对比一下两者代价：</p>
+
+  <table class="compare-tbl">
+    <thead><tr><th>对比项</th><th>list_head（双向循环）</th><th>hlist（哈希单链）</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>头节点大小</td>
+        <td><code>next + prev</code> = 2 个指针</td>
+        <td><code>first</code> = <strong>1 个指针</strong></td>
+      </tr>
+      <tr>
+        <td>每个节点大小</td>
+        <td><code>next + prev</code> = 2 个指针</td>
+        <td><code>next + pprev</code> = 2 个指针（一样）</td>
+      </tr>
+      <tr>
+        <td>能否双向遍历</td>
+        <td>能（循环）</td>
+        <td>能（靠 pprev）</td>
+      </tr>
+      <tr>
+        <td>典型用途</td>
+        <td>通用双向链表</td>
+        <td>哈希桶头（成千上万个）</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    节省只发生在<strong>桶头</strong>上，但哈希表里桶头数量远多于实际节点（多数桶空着），所以总账很划算。
+  </p>
+
+
+  <h2 id="pprev">精髓：<code>pprev</code> 为什么是双指针</h2>
+
+  <p>
+    这是这节课最难、也最值的一点。慢慢看。
+  </p>
+
+  <p>
+    在 <code>list_head</code> 里，<code>prev</code> 指向"前一个节点"。但 hlist 的桶头是
+    <code>hlist_head</code> 类型，节点是 <code>hlist_node</code> 类型——<strong>类型不一样</strong>。
+    如果第一个节点的 <code>prev</code> 想指回桶头，它存什么？存 <code>hlist_head*</code> 吗？
+    那它就和其他节点（存 <code>hlist_node*</code>）类型不一致，每次删除都得判断"我是不是第一个节点"。
+  </p>
+
+  <p>内核的解法极其优雅：<strong>让 pprev 指向"指向我的那个指针本身"</strong>，而不是指向我前面的节点。</p>
+
+  <div class="memfig">第一个节点：pprev 指向桶头的 first 字段
+
+  hlist_head            hlist_node(第一个)      hlist_node(第二个)
+  ┌──────────┐          ┌──────────────┐       ┌──────────────┐
+  │ <span class="hl">first ─────────────→ next ──────────→ next ─→ ...</span>
+  │          │          │              │       │              │
+  │          │          │ <span class="ok">pprev ────────┐</span>  │       │ <span class="ok">pprev ──────────────┐</span>
+  └──────────┘          └──────────────┘       └──────────────┘   │
+                          <span class="dim">↑ 指向 &head->first</span>            │
+                          <span class="ok">└──────────────────────────────┘</span>
+                                                       <span class="dim">↑ 指向 &prev->next</span></div>
+
+  <div class="memfig">关键洞察：无论是不是第一个节点，pprev 都指向"指向前一个链域的地址"
+
+  情况 A（桶中第一个节点）：
+    node-&gt;pprev == &amp;head-&gt;first          <span class="dim">// 指向桶头的 first 字段</span>
+
+  情况 B（桶中非第一个节点）：
+    node-&gt;pprev == &amp;prev-&gt;next            <span class="dim">// 指向前一个节点的 next 字段</span>
+
+  <span class="hl">两种情况下 *node-&gt;pprev 都等于 node 本身</span>——这正是统一的来源。</div>
+
+
+  <h2 id="delete">统一删除：双指针的回报</h2>
+
+  <p>
+    这就是 <code>**pprev</code> 换来的核心收益：<strong>删除任意节点只需一行，无需特判桶头</strong>。
+  </p>
+
+  <pre><code><span class="com">// 删除一个 hlist 节点（include/linux/list.h 简化版）</span>
+<span class="kw">static</span> <span class="kw">inline</span> <span class="type">void</span> hlist_del(<span class="kw">struct</span> hlist_node *n)
+{
+    <span class="kw">struct</span> hlist_node *next = n-&gt;next;
+    <span class="kw">struct</span> hlist_node **pprev = n-&gt;pprev;
+
+    <span class="com">// *pprev 就是"指向我的那个指针"——写它就把我从链上摘掉</span>
+    *pprev = next;              <span class="com">// 前一个链域，改成指向我的下一个</span>
+    <span class="kw">if</span> (next)
+        next-&gt;pprev = pprev;   <span class="com">// 让下一个回指到前一个链域</span>
+}</code></pre>
+
+  <p>对比如果用单指针 <code>prev</code> 会怎样：</p>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>若用 *prev（朴素做法）</h4>
+      <p>删除中间节点：OK，<code>prev-&gt;next = next; next-&gt;prev = prev;</code></p>
+      <p>删除第一个节点：炸了——<code>prev</code> 此时指向桶头（不同类型），
+      要 <code>head-&gt;first = next</code>，<strong>必须 if 判断是不是第一个</strong>。</p>
+      <p>结果：每个删除函数里都要写两套分支。</p>
+    </div>
+    <div class="col">
+      <h4>用 **pprev（内核做法）</h4>
+      <p>无论哪个节点：<code>*pprev = next;</code> 一行搞定。</p>
+      <p>因为 <code>pprev</code> 已经是"指向我的指针的地址"——
+      对它解引用并赋值，就改掉了前一个链域。</p>
+      <p>结果：<strong>无分支，O(1) 删除</strong>，代码简洁不易错。</p>
+    </div>
+  </div>
+
+  <aside class="callout">
+    <span class="callout-title">给 C 工程师的提醒</span>
+    这是"指针的指针"的教科书级用例：当你需要对一组"名字不同、类型不同、但语义相同"的指针字段做统一操作时，
+    用 <code>**</code> 拍平它们。内核源码里这类手法反复出现（页表、VFS 路径查找都用到类似思想）。
+  </aside>
+
+
+  <h2 id="api">常用 API</h2>
+
+  <table>
+    <thead><tr><th>API</th><th>做什么</th></tr></thead>
+    <tbody>
+      <tr><td><code>HLIST_HEAD(name)</code></td><td>声明并初始化一个 hlist 头（静态）。</td></tr>
+      <tr><td><code>hlist_add_head(&amp;node, &amp;head)</code></td><td>把节点插到桶头（最常用）。</td></tr>
+      <tr><td><code>hlist_add_behind(&amp;prev, &amp;node)</code></td><td>插到某节点之后。</td></tr>
+      <tr><td><code>hlist_del(&amp;node)</code></td><td>摘除节点（一行式统一删除）。</td></tr>
+      <tr><td><code>hlist_for_each_entry(item, &amp;head, member)</code></td><td>遍历桶中所有节点，自动用 container_of 取宿主。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    你会发现这些 API 和 <code>list_*</code> 几乎一一对应——内核设计 API 时刻意保持了一致性。
+    会了 list_head，hlist 的学习成本主要就集中在"理解 pprev"上。
+  </p>
+
+
+  <h2 id="lab">动手实验：一个迷你哈希表</h2>
+
+  <p>
+    目标：用内核提供的 <a href="https://www.kernel.org/doc/html/latest/core-api/hashtables.html" target="_blank" rel="noopener"><code>DECLARE_HASHTABLE</code> 宏</a>
+    建一个 8 个桶的小哈希表，存 5 个"蓝牙设备"，按地址哈希分散到桶里，加载时打印每个桶的内容。
+    这恰好是你做 WiFi/蓝牙驱动时遇到的"按地址查设备"的真实结构。
+  </p>
+  <aside class="callout warn">
+    <span class="callout-title">前提</span>
+    内核哈希表 API 在 <code>linux/hashtable.h</code>（Linux 3.97+ 标准，你的 6.6.87.2 当然支持）。
+    你已经在 <code>../doc/WSL2内核编译与驱动环境搭建.md</code> 里把内核编译 + <code>/lib/modules/$(uname -r)/build</code> 软链都弄好了，
+    直接复用那个环境即可——这节课的 <code>.ko</code> 是纯软件模块，WSL2 完全能加载运行。
+  </aside>
+
+  <p>
+    <strong>关于代码风格的一个小说明</strong>：你在第 1 课的 <code>bt_list.c</code> 里用了 <code>uint16_t</code>（stdint 风格），
+    这能跑。但内核源码惯例是用 <code>linux/types.h</code> 里的 <code>u8/u16/u32/u64</code>（还有 <code>__u32</code> 用于用户可见的 ABI）。
+    本课示例统一用内核风格的 <code>u16</code>——读内核源码时你看到的也全是这个。两套在模块里都合法，但熟悉内核那套能让你读源码更顺。
+  </p>
+
+  <p><strong>① 源码 <code>bt_hash.c</code></strong></p>
+
+  <pre><code><span class="com">// bt_hash.c — 第 2 课实验：用 hlist 哈希表管理蓝牙设备</span>
+<span class="kw">#include</span> &lt;linux/module.h&gt;
+<span class="kw">#include</span> &lt;linux/kernel.h&gt;
+<span class="kw">#include</span> &lt;linux/list.h&gt;        <span class="com">// hlist 在这里</span>
+<span class="kw">#include</span> &lt;linux/hashtable.h&gt;  <span class="com">// DECLARE_HASHTABLE / hash_add / hash_for_each</span>
+<span class="kw">#include</span> &lt;linux/slab.h&gt;
+<span class="kw">#include</span> &lt;linux/random.h&gt;
+
+<span class="kw">struct</span> bt_device {
+    <span class="type">u16</span>               addr;
+    <span class="type">char</span>              name[16];
+    <span class="kw">struct</span> hlist_node node;     <span class="com">// ← 嵌入 hlist 节点</span>
+};
+
+<span class="com">// 声明一个 8 桶哈希表（桶数必须是 2 的幂）</span>
+<span class="kw">static</span> DECLARE_HASHTABLE(bt_table, 3);   <span class="com">// 2^3 = 8 个桶</span>
+
+<span class="kw">static</span> <span class="type">int</span> __init bt_hash_init(<span class="type">void</span>)
+{
+    <span class="type">int</span> i;
+    <span class="kw">struct</span> bt_device *dev;
+    <span class="type">u16</span> addrs[] = { 0x1122, 0x3344, 0x5566, 0x7788, 0x1122 + 0x8 }; <span class="com">// 故意制造一些冲突</span>
+
+    pr_info(<span class="str">"bt_hash: 加载\n"</span>);
+
+    <span class="kw">for</span> (i = 0; i &lt; 5; i++) {
+        dev = kzalloc(<span class="kw">sizeof</span>(*dev), GFP_KERNEL);
+        <span class="kw">if</span> (!dev) <span class="kw">return</span> -ENOMEM;
+        dev-&gt;addr = addrs[i];
+        scnprintf(dev-&gt;name, <span class="kw">sizeof</span>(dev-&gt;name), <span class="str">"BT-%d"</span>, i);
+
+        <span class="com">// 关键：按 addr 哈希，挂进对应桶。hash_32 把值映射到 [0, 桶数)。</span>
+        hash_add(bt_table, &amp;dev-&gt;node, dev-&gt;addr);
+    }
+
+    <span class="com">// 遍历整个哈希表，逐桶打印</span>
+    <span class="kw">struct</span> bt_device *cur;
+    <span class="type">int</span> bkt;
+    pr_info(<span class="str">"bt_hash: 哈希表内容:\n"</span>);
+    hash_for_each(bt_table, bkt, cur, node) {
+        pr_info(<span class="str">"  bucket[%d] - %s (addr=0x%04x)\n"</span>, bkt, cur-&gt;name, cur-&gt;addr);
+    }
+    <span class="kw">return</span> 0;
+}
+
+<span class="kw">static</span> <span class="type">void</span> __exit bt_hash_exit(<span class="type">void</span>)
+{
+    <span class="type">int</span> bkt;
+    <span class="kw">struct</span> bt_device *cur;
+    <span class="kw">struct</span> hlist_node *tmp;
+
+    <span class="com">// 边遍历边删，必须用 _safe 版本（桶里是 hlist）</span>
+    hash_for_each_safe(bt_table, bkt, tmp, cur, node) {
+        pr_info(<span class="str">"bt_hash: 删除 %s\n"</span>, cur-&gt;name);
+        hash_del(&amp;cur-&gt;node);
+        kfree(cur);
+    }
+    pr_info(<span class="str">"bt_hash: 卸载\n"</span>);
+}
+
+module_init(bt_hash_init);
+module_exit(bt_hash_exit);
+MODULE_LICENSE(<span class="str">"GPL"</span>);
+MODULE_DESCRIPTION(<span class="str">"Lesson 2: hlist hash table demo"</span>);</code></pre>
+
+  <p><strong>② 跑起来</strong></p>
+
+  <ol class="steps">
+    <li>编译：<code>make</code>（复用第 1 课的 Makefile，把 <code>obj-m</code> 改成 <code>bt_hash.o</code>）</li>
+    <li>加载：<code>sudo insmod bt_hash.ko</code></li>
+    <li>看桶分布：<code>dmesg | tail</code> —— 你会看到 5 个设备散落在 8 个桶中，地址相近的可能撞到同桶</li>
+    <li>卸载：<code>sudo rmmod bt_hash</code></li>
+  </ol>
+
+  <aside class="callout tip">
+    <span class="callout-title">观察重点</span>
+    用 <code>dmesg</code> 输出对照地址 <code>0x1122</code> 和 <code>0x1122 + 0x8</code>——
+    它们哈希到同一个桶的概率应该较高。<strong>这正是哈希冲突的真实样子</strong>，
+    冲突时一个桶里就是一条 hlist 冲突链。看到它，你就理解了 hlist 存在的全部理由。
+  </aside>
+
+
+  <h2 id="check">检验理解</h2>
+
+  <div class="quiz" data-correct="b" data-explain="hlist_head 用单指针 first 而非双指针，是因为哈希表可能有成千上万个桶、绝大多数为空桶——桶头省一个指针，全局省下的内存非常可观。代价是节点结构稍复杂（pprev 改为双指针），但节点总数远少于桶数，权衡划算。与现代 CPU 缓存行、内核 ABI 都无关。">
+    <p class="quiz-q">为什么 hlist 的桶头（hlist_head）只用一个指针，而 list_head 用两个？</p>
+    <label class="quiz-opt"><input type="radio" name="q1" value="a">节省 CPU 缓存行加载次数</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="b">哈希桶数量大且多为空桶</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="c">简化内核对外 ABI 接口</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="d">兼容旧版本编译器限制</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="c" data-explain="pprev 是指向"指向我的那个指针"的地址。对第一个节点是 &head->first，对其他节点是 &prev->next。于是 *pprev = next 这一句，无论节点在哪都能统一把"指向我的字段"改写成指向我的下一个——删除无需特判桶头。这就是用双指针换统一性的精髓。">
+    <p class="quiz-q">hlist_node 的 pprev 指向什么？这让删除操作获得了什么好处？</p>
+    <label class="quiz-opt"><input type="radio" name="q2" value="a">前一个节点本身；遍历更快</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="b">下一个节点本身；插入更快</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="c">指向前一链域的地址；删除无特判</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="d">桶头本身；查找变为 O(1)</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+
+  <h2 id="next">接下来</h2>
+
+  <p>
+    到这里，你掌握了内核的两种主力链表：<code>list_head</code>（通用双向）和 <code>hlist</code>（哈希专用）。
+    它们覆盖了内核里<strong>"线性关系"</strong>的绝大部分场景。
+  </p>
+
+  <p>
+    但内核里还有一类<strong>"有序关系"</strong>场景——需要快速查找/插入/删除的有序集合，
+    链表做不到（O(n)），这时内核用<strong>红黑树（rbtree）</strong>。
+    这就是第 3 课的主题：CFS 完全公平调度器、ext4 区段树都用它。
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">推荐精读</span>
+    主教材《图解Linux内核》§2.1「关系型数据结构」（同章其余小节）。
+    英文权威：LWN 经典文章 <a href="https://lwn.net/Articles/336255/" target="_blank" rel="noopener">"Linux kernel design patterns - part 2"</a>（Neil Brown）——
+    它正好有一节专门讲 hlist 为何省一个指针，与本课对照极佳。
+  </aside>
+
+  <h3>带着这些问题进入下一课（或现在问我）</h3>
+  <ul>
+    <li><strong>内核红黑树为什么是"手写"的，不像链表那样提供现成的插入/删除函数？</strong>——这引出 rbtree 的设计哲学。</li>
+    <li><strong>哈希表的桶数怎么选？</strong>——引出负载因子与内核哈希宏的选择策略。</li>
+    <li><strong>除了 list/hlist/rbtree，内核还有哪些"关系型"结构？</strong>——引出 xarray、基数树（进程地址空间用）。</li>
+  </ul>
+
+  <p class="lesson-nav">
+    <a href="0001-intrusive-list-head.html">← 第 1 课：list_head</a>
+    <a href="#">第 3 课（待生成）→</a>
+  </p>
+
+  <hr>
+  <p style="font-family:var(--sans);font-size:.85rem;color:var(--ink-mute);">
+    学完后，<strong>回来告诉我你的反馈</strong>：双指针那段讲清楚了吗？实验跑通了吗？
+    或者你对红黑树那部分已经迫不及待——都可以说。这些会决定第 3 课怎么写。
+  </p>
+
+</div>
+</body>
+</html>
