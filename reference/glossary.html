@@ -55,7 +55,7 @@
   <h1>术语表（Glossary）</h1>
   <p class="lesson-meta">
     <span class="chip">随课程扩充</span>
-    <span class="chip">已收录 12 条</span>
+    <span class="chip">已收录 15 条</span>
     <a href="../lessons/0001-intrusive-list-head.html">← 回到第 1 课</a>
   </p>
   <p class="glossary-intro">
@@ -175,6 +175,32 @@
       中断处理的分工：上半部 = 硬中断 ISR，只做最紧急的事（如确认中断、拷贝数据）；
       下半部 = 延迟完成的工作（如协议处理、唤醒进程），由软中断 / tasklet / 工作队列承载。
       这样能尽快重新打开中断、提高系统响应能力。
+    </dd>
+  </dl>
+
+  <p class="group-label">哈希与 hlist（第 2 课）</p>
+
+  <dl class="gloss">
+    <dt>哈希桶 <span class="en">hash bucket</span></dt>
+    <dd>
+      哈希表数组的单个元素。每个桶挂一条"冲突链"——所有哈希到同一个桶的元素串在这条链上。
+      哈希表 = 桶数组 + 每桶上的链表。桶数通常是 2 的幂。
+    </dd>
+
+    <dt>struct hlist_head / hlist_node <span class="en">hlist — hash list</span></dt>
+    <dd>
+      内核为哈希表特制的链表类型。<code>hlist_head</code> 只有 <code>first</code> 一个指针
+      （为成千上万的桶节省一半头内存）；<code>hlist_node</code> 的 <code>pprev</code> 是<strong>双指针</strong>，
+      指向"指向我的那个链域"（桶头的 <code>first</code> 或前一节点的 <code>next</code>），
+      使删除任意节点无需特判桶头。
+      <span class="avoid">避免把 hlist 当通用双向链表用——它专为哈希桶设计，不循环。</span>
+    </dd>
+
+    <dt>pprev（双指针） <span class="en">pointer-to-pointer back link</span></dt>
+    <dd>
+      hlist_node 里指向前一链域<strong>地址</strong>的字段。它不是指向前一个节点，而是指向"指向前一个节点的那个指针"。
+      因此 <code>*pprev = next</code> 这一句在头节点和中间节点上都成立，删除操作统一为无分支代码。
+      这是 C 双指针在内核里的经典用例。
     </dd>
   </dl>
 
