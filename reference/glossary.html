@@ -55,7 +55,7 @@
   <h1>术语表（Glossary）</h1>
   <p class="lesson-meta">
     <span class="chip">随课程扩充</span>
-    <span class="chip">已收录 15 条</span>
+    <span class="chip">已收录 19 条</span>
     <a href="../lessons/0001-intrusive-list-head.html">← 回到第 1 课</a>
   </p>
   <p class="glossary-intro">
@@ -201,6 +201,51 @@
       hlist_node 里指向前一链域<strong>地址</strong>的字段。它不是指向前一个节点，而是指向"指向前一个节点的那个指针"。
       因此 <code>*pprev = next</code> 这一句在头节点和中间节点上都成立，删除操作统一为无分支代码。
       这是 C 双指针在内核里的经典用例。
+    </dd>
+  </dl>
+
+  <p class="group-label">红黑树与有序结构（第 3 课）</p>
+
+  <dl class="gloss">
+    <dt>红黑树 <span class="en">red-black tree, rbtree</span></dt>
+    <dd>
+      一种自平衡二叉搜索树，每个节点带红/黑颜色，靠 5 条性质保证最长路径不超过最短路径的两倍，
+      查找/插入/删除均为 O(log n)。内核用它存储<strong>有序、需频繁增删查</strong>的集合
+      （调度器就绪队列、ext4 区段树、timerfd 等）。与 list_head 一样采用侵入式：节点嵌入用户结构体。
+    </dd>
+
+    <dt>struct rb_node / rb_root <span class="en">kernel rbtree node / root</span></dt>
+    <dd>
+      内核红黑树的节点与根类型。<code>rb_node</code> 含 <code>__rb_parent_color</code>（父指针 + 颜色合用一个字）、
+      <code>rb_left</code>、<code>rb_right</code>。<code>rb_root</code> 只含一个指向根节点的指针，用 <code>RB_ROOT</code> 初始化。
+      <span class="ref">设计哲学：内核只提供节点 + 平衡算法（rb_insert_color/rb_erase），比较与定位插入位置由使用者自己写——避免热路径的间接调用开销。</span>
+    </dd>
+
+    <dt>黑高 <span class="en">black-height</span></dt>
+    <dd>
+      红黑树性质 5 的核心概念：从某节点到其所有后代叶子（NULL）路径上的<strong>黑节点数量</strong>。
+      红黑树要求同一节点的所有路径黑高相同，这是保证平衡的数学基础。
+    </dd>
+
+    <dt>EEVDF <span class="en">Earliest Eligible Virtual Deadline First</span></dt>
+    <dd>
+      Linux 6.6 起取代 CFS 的 CPU 调度算法。仍在 <code>cfs_rq</code> 里用 rbtree（<code>tasks_timeline</code>），
+      但排序键从 CFS 的 <code>vruntime</code> 改为<strong>虚拟截止时间</strong>。EEVDF 还引入"资格"判定。
+      <span class="avoid">避免再说"6.6 还在用 CFS / 按 vruntime 排"——已过时。</span>
+    </dd>
+
+    <dt>CFS <span class="en">Completely Fair Scheduler</span></dt>
+    <dd>
+      Linux 2.6.23 起的"完全公平调度器"，核心是用 rbtree 按 vruntime 排序就绪任务，最左（vruntime 最小）者先跑。
+      <strong>6.6 起 EEVDF 取代了 CFS</strong>，但代码仍沿用 cfs_rq / tasks_timeline / sched_entity 结构，只是算法变。
+      本书的调度篇（§14）以 CFS 为主线，读时需对照 EEVDF 的版本演进。
+    </dd>
+
+    <dt>maple tree <span class="en">maple tree</span></dt>
+    <dd>
+      一种 RCU 安全、基于 B 树、缓存友好的<strong>区间树</strong>，专为存储非重叠地址区间设计。
+      6.1 起用它取代了 <code>mm_struct</code> 里组织 VMA 的 rbtree + 链表（<code>mm_mt</code> 字段）。
+      6.6 迁移完成。<span class="avoid">避免再说"VMA 用红黑树"——6.1 起已过时。注意：调度器仍用 rbtree，maple tree 只取代了 VMA 那处。</span>
     </dd>
   </dl>
 
