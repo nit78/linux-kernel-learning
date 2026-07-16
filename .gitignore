@@ -20,3 +20,15 @@ desktop.ini
 # ===== 操作系统杂项 =====
 ehthumbs.db
 $RECYCLE.BIN/
+
+# ===== 内核模块构建产物 (make 后生成, 绝不入库) =====
+# 只跟踪 .c 源码和 Makefile, 不跟踪编译输出
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
