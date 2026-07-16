@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 3 课 · 红黑树 rbtree</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/quiz.js" defer></script>
+<style>
+  .treefig {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.45;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1.3rem 0;
+    color: var(--ink);
+  }
+  .treefig .r { color: #b00020; font-weight: 600; }   /* 红 */
+  .treefig .k { color: var(--ink); font-weight: 600; } /* 黑 */
+  .treefig .dim { color: var(--ink-mute); }
+  .treefig .hl { color: var(--accent); font-weight: 600; }
+  .tree-diagram { text-align:center; overflow-x:auto; margin:1.4rem 0; }
+  .tree-diagram svg { max-width:100%; height:auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="lesson-meta">
+    <span class="chip">第 3 课</span>
+    <span class="chip">知识储备篇 · §2.2 数据结构</span>
+    <span class="chip">Linux 6.6 (你的环境)</span>
+    <a href="../reference/glossary.html">术语表</a>
+  </p>
+
+  <h1>红黑树（rbtree）：内核里的"有序集合"</h1>
+
+  <p>
+    链表（list_head）和哈希链表（hlist）解决的是<strong>"串起来"</strong>和<strong>"按桶找"</strong>。
+    但内核里还有一类场景:<em>按大小排序、要快速插入/删除/查找最值</em>——链表的 O(n) 查找撑不住,
+    这时内核用<strong>红黑树</strong>。这节课讲清它的原理,再用真实的 <code>struct rb_node</code> 动手。
+  </p>
+
+  <aside class="callout tip">
+    <span class="callout-title">为什么红黑树,不是 AVL、不是跳表</span>
+    红黑树在"平衡程度"和"调整代价"之间取了工程上的甜点:插入/删除最多 3 次旋转就能恢复平衡,
+    比严格平衡的 AVL 调整更省。内核要的是<em>最坏情况可控、均摊开销低</em>,红黑树正合适。
+  </aside>
+
+
+  <h2 id="properties">原理:红黑树的 5 条性质</h2>
+
+  <p>红黑树是一棵<strong>自平衡二叉搜索树</strong>,每个节点带一个颜色(红/黑)。它靠 5 条性质保证"没有一条路径会比另一条长两倍以上",于是查找/插入/删除都是 O(log n):</p>
+
+  <ol>
+    <li>每个节点是<strong>红</strong>或<strong>黑</strong>。</li>
+    <li><strong>根</strong>是黑的。</li>
+    <li>每个<strong>叶子</strong>(这里的叶子指 <code>NULL</code> 空节点)是黑的。</li>
+    <li>红节点的<strong>孩子必须是黑的</strong>——即不能有两个连续的红节点(红节点不挨着)。</li>
+    <li>从任一节点到其所有后代叶子的<strong>路径上黑节点数量相同</strong>。这个数量叫该节点的<strong>黑高</strong>。</li>
+  </ol>
+
+  <p>第 4、5 条是核心。它们联手的效果:最长路径(红黑交替)最多是最短路径(全黑)的两倍。</p>
+
+  <div class="treefig">一棵合法的红黑树(<span class="r">R</span>=红, <span class="k">B</span>=黑)。注意每条根→叶路径黑节点数都是 2。
+
+              <span class="k">(13 B)</span>
+             /          \
+        <span class="r">(8 R)</span>            <span class="r">(17 R)</span>
+        /     \           /        \
+    <span class="k">(1 B)</span>  <span class="k">(11 B)</span>  <span class="k">(15 B)</span>  <span class="k">(25 B)</span>
+                                  /
+                              <span class="r">(22 R)</span>
+
+  <span class="dim">根→1:    B        → 1 个黑节点(根本身) + 1(叶子) = 黑高 2</span>
+  <span class="dim">根→22→叶: B-R-B-叶 = 黑高 2  ✓</span>
+  <span class="dim">没有两个红相邻;每条路径黑节点数相等。</span></div>
+
+  <aside class="callout">
+    <span class="callout-title">旋转,直觉版</span>
+    插入/删除后如果违反了性质 4 或 5,就用<strong>左旋 / 右旋</strong>把树重新摆平衡。
+    旋转不改变二叉搜索树的"中序有序"性质——这是它能用来修复红黑树的前提。
+    本课不背旋转的 3 种 case,你只要记住:<strong>内核已经帮你写好了</strong>(<code>rb_insert_color</code> / <code>rb_erase</code>),
+    你要做的是按规则插入,剩下交给它。
+  </aside>
+
+
+  <h2 id="kernel-design">内核 rbtree 的"半成品"设计</h2>
+
+  <p>这是读内核代码必须先知道的一件事,很多人卡在这里:</p>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>你期待的通用库</h4>
+      <p>像 C++ STL 的 <code>std::map</code>:<code>insert(key, value)</code>、<code>find(key)</code>,一键搞定。</p>
+      <p>比较函数由模板参数固定,数据和节点由库管理。</p>
+    </div>
+    <div class="col">
+      <h4>内核 rbtree 实际提供</h4>
+      <p><strong>只给节点 + 平衡算法</strong>。<code>rb_node</code> 同样是侵入式的(嵌进你的结构体)。</p>
+      <p><strong>比较、查找、插入位置你自己写</strong>——内核只负责插入后的<strong>重新着色和旋转</strong>(<code>rb_insert_color</code>)。</p>
+    </div>
+  </div>
+
+  <p>真实定义非常小:</p>
+
+  <pre><code><span class="com">// include/linux/rbtree_types.h</span>
+<span class="kw">struct</span> <span class="type">rb_node</span> {
+    <span class="type">unsigned</span> <span class="type">long</span>  __rb_parent_color;  <span class="com">// 把"父指针 + 颜色"塞进一个字</span>
+    <span class="kw">struct</span> rb_node *rb_right;
+    <span class="kw">struct</span> rb_node *rb_left;
+} __attribute__((aligned(<span class="kw">sizeof</span>(<span class="type">long</span>))));
+
+<span class="kw">struct</span> <span class="type">rb_root</span> {
+    <span class="kw">struct</span> rb_node *rb_node;
+};
+
+<span class="kw">#define</span> RB_ROOT  (<span class="kw">struct</span> rb_root) { NULL, }  <span class="com">// 空树</span></code></pre>
+
+  <aside class="callout">
+    <span class="callout-title">那个 <code>__rb_parent_color</code> 很妙</span>
+    节点的"颜色"只是 1 bit,单独存太浪费。内核把<strong>父节点指针的最低位</strong>当颜色位用
+    (因为 <code>rb_node</code> 用 <code>aligned(sizeof(long))</code> 对齐,指针低 1~3 位永远是 0,可以拿来存 bit)。
+    一个字既存父指针又存颜色——这是用空间对齐特性省内存的经典手法,你在内核里会反复见到类似套路。
+  </aside>
+
+  <p><strong>为什么要你"自己写插入比较"?因为泛型代价高。</strong> 不同子系统对"键怎么比较"千差万别
+  (调度器比 vruntime、ext4 比磁盘块号、定时器比到期时间)。内核宁可让每个使用者写十几行比较循环,
+  也不强行抽象出一个带函数指针的泛型树——<strong>省掉一次间接调用,在热路径上值得</strong>。
+
+
+  <h2 id="api">核心 API:插入 / 删除 / 遍历</h2>
+
+  <table>
+    <thead><tr><th>API</th><th>做什么</th></tr></thead>
+    <tbody>
+      <tr><td><code>RB_ROOT</code></td><td>声明一棵空树(<code>struct rb_root root = RB_ROOT;</code>)。</td></tr>
+      <tr><td><code>rb_link_node(node, parent, &amp;link)</code></td><td>把新节点<strong>挂到树形结构</strong>上(还<em>没</em>平衡)。你先自己遍历找到插入位置 <code>parent</code> 和挂载点 <code>link</code>。</td></tr>
+      <tr><td><code>rb_insert_color(node, root)</code></td><td>对刚 <code>rb_link_node</code> 的节点做<strong>重新着色 + 旋转</strong>恢复红黑性质。两步合起来才是一次完整插入。</td></tr>
+      <tr><td><code>rb_erase(node, root)</code></td><td>删除节点(含自动再平衡)。</td></tr>
+      <tr><td><code>rb_first(root)</code> / <code>rb_last(root)</code></td><td>取最小 / 最大节点——O(log n) 直奔最左 / 最右。</td></tr>
+      <tr><td><code>rb_next(node)</code> / <code>rb_prev(node)</code></td><td>中序遍历的后继 / 前驱——按排序顺序走。</td></tr>
+    </tbody>
+  </table>
+
+  <p>插入一个节点的标准骨架(你以后会在内核里反复看到这个模式):</p>
+
+  <pre><code><span class="com">// 向 root 中按 key 插入 data-&gt;node。自定义比较。</span>
+<span class="kw">static</span> <span class="type">void</span> my_insert(<span class="kw">struct</span> rb_root *root, <span class="kw">struct</span> my_type *data)
+{
+    <span class="kw">struct</span> rb_node **new  = &amp;root-&gt;rb_node;   <span class="com">// 指向"当前要看的槽位"</span>
+    <span class="kw">struct</span> rb_node  *parent = NULL;
+
+    <span class="kw">while</span> (*new) {                            <span class="com">// 1. 自己走树找位置</span>
+        <span class="kw">struct</span> my_type *this = container_of(*new, <span class="kw">struct</span> my_type, node);
+        parent = *new;
+        <span class="kw">if</span> (data-&gt;key &lt; this-&gt;key)
+            new = &amp;((*new)-&gt;rb_left);
+        <span class="kw">else</span> <span class="kw">if</span> (data-&gt;key &gt; this-&gt;key)
+            new = &amp;((*new)-&gt;rb_right);
+        <span class="kw">else</span>
+            <span class="kw">return</span>;                       <span class="com">// 重复键,不插</span>
+    }
+
+    rb_link_node(&amp;data-&gt;node, parent, new);   <span class="com">// 2. 挂上树形</span>
+    rb_insert_color(&amp;data-&gt;node, root);       <span class="com">// 3. 重新平衡</span>
+}</code></pre>
+
+  <p>看到 <code>**new</code> 了么?跟第 2 课 hlist 的 <code>**pprev</code> 是<strong>同一个套路</strong>:
+  一个指向"指针的指针",用来在找到位置后直接把新节点写进正确的槽位。你已经懂这个手法了。
+
+
+  <h2 id="real-users">真实用例:调度器(以及一个必须纠正的旧说法)</h2>
+
+  <h3>用例 A:进程调度器 —— rbtree 仍在用,但要说对名字</h3>
+
+  <p>很多老资料说"CFS 用红黑树,按 vruntime 排序"。这话<strong>在 6.6 已经不准确了</strong>:</p>
+
+  <table>
+    <thead><tr><th>版本</th><th>调度算法</th><th>rbtree 按…排序</th></tr></thead>
+    <tbody>
+      <tr><td>2.6.23 ~ 6.5</td><td><strong>CFS</strong>(完全公平调度)</td><td><code>vruntime</code>(虚拟运行时间,最小者在最左)</td></tr>
+      <tr><td><strong>6.6 起</strong></td><td><strong>EEVDF</strong>(CFS 的继任者)</td><td><strong>虚拟截止时间</strong>(virtual deadline)</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <strong>rbtree 本身没被换掉</strong>——<code>cfs_rq</code> 里的 <code>tasks_timeline</code>(一棵 <code>rb_root_cached</code>)、
+    <code>sched_entity</code> 里嵌入的 <code>rb_node</code> 都还在。换的是<strong>排序的键</strong>:从 vruntime 改成虚拟截止时间。
+    EEVDF 的核心思想是"给每个就绪任务算一个截止时间,谁截止最早谁先跑",rbtree 用来高效取"截止最早者"(最左节点)。
+  </p>
+
+  <aside class="callout warn">
+    <span class="callout-title">记忆纠偏</span>
+    在你的环境(6.6.87.2)里,说"调度器用 rbtree"对,但说"CFS 用 rbtree 按 vruntime 排"就过时了。
+    内核在演进,术语要跟着版本走——这正是读 LWN 跟踪社区变化的理由。本书对应 6.2,接近 EEVDF 切换点,读到调度篇时(§14)要注意这个时间线。
+  </aside>
+
+  <h3>用例 B:进程地址空间 VMA —— rbtree <em>已被取代</em></h3>
+
+  <p>这是另一个必须当场纠正的常见说法。老资料常说"进程的 VMA(虚拟内存区域)用红黑树组织"。这在 6.1 <strong>已经变了</strong>:</p>
+
+  <table>
+    <thead><tr><th>版本</th><th>VMA 存储结构</th></tr></thead>
+    <tbody>
+      <tr><td>≤ 6.0</td><td><code>mm_struct</code> 里一棵 rbtree + 一个链表(双索引)</td></tr>
+      <tr><td><strong>6.1 起</strong></td><td><strong>maple tree</strong>(<code>mm_struct.mm_mt</code>)取代了 rbtree + 链表</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <strong>maple tree</strong> 是一种 RCU 安全、基于 B 树、对缓存友好的区间树,专为"非重叠的地址区间"设计。
+    它在 VMA 这个场景(频繁按地址区间查找)上比 rbtree 更快、更好用。<strong>你的 6.6 内核里,VMA 已经不在 rbtree 里了。</strong>
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">这堂课的元教训</span>
+    红黑树仍是内核主力数据结构(CFS/EEVDF 调度、ext4 区段树、timerfd、keyctl、内存 cgroup…),
+    但<strong>具体用在哪</strong>随版本变化。读到"X 用 rbtree"时,在心里加一句"截至某版本",并准备查证。
+    这就是为什么主教材标了"基于 6.x"——版本敏感是内核学习的常态。
+  </aside>
+
+
+  <h2 id="lab">动手实验:维护一棵真实的 rbtree</h2>
+
+  <p>
+    目标:写一个 <code>.ko</code>,用真实 <code>struct rb_node</code> 维护一棵按"设备 id"排序的红黑树。
+    插入 5 个节点(故意乱序),加载时中序遍历打印(应看到升序输出),卸载时清空。
+    你会亲手写出"自己找位置 + rb_link_node + rb_insert_color"这套内核标准插入模式。
+  </p>
+
+  <p><strong>源码 <code>bt_rbtree.c</code></strong></p>
+
+  <pre><code><span class="com">// bt_rbtree.c — 第 3 课实验:真实内核红黑树</span>
+<span class="kw">#include</span> &lt;linux/module.h&gt;
+<span class="kw">#include</span> &lt;linux/kernel.h&gt;
+<span class="kw">#include</span> &lt;linux/rbtree.h&gt;
+<span class="kw">#include</span> &lt;linux/slab.h&gt;
+
+<span class="kw">struct</span> bt_dev {
+    <span class="type">int</span>               id;            <span class="com">// 排序键</span>
+    <span class="type">char</span>              name[16];
+    <span class="kw">struct</span> rb_node    node;          <span class="com">// ← 嵌入红黑树节点</span>
+};
+
+<span class="kw">static</span> <span class="kw">struct</span> rb_root bt_tree = RB_ROOT;
+
+<span class="com">/* 自己写插入:遍历找位置 → rb_link_node → rb_insert_color */</span>
+<span class="kw">static</span> <span class="type">int</span> bt_insert(<span class="kw">struct</span> rb_root *root, <span class="kw">struct</span> bt_dev *dev)
+{
+    <span class="kw">struct</span> rb_node **new  = &amp;root-&gt;rb_node;
+    <span class="kw">struct</span> rb_node  *parent = NULL;
+
+    <span class="kw">while</span> (*new) {
+        <span class="kw">struct</span> bt_dev *cur = container_of(*new, <span class="kw">struct</span> bt_dev, node);
+        parent = *new;
+        <span class="kw">if</span> (dev-&gt;id &lt; cur-&gt;id)
+            new = &amp;(*new)-&gt;rb_left;
+        <span class="kw">else</span> <span class="kw">if</span> (dev-&gt;id &gt; cur-&gt;id)
+            new = &amp;(*new)-&gt;rb_right;
+        <span class="kw">else</span>
+            <span class="kw">return</span> -EEXIST;       <span class="com">// 重复 id 不插</span>
+    }
+    rb_link_node(&amp;dev-&gt;node, parent, new);
+    rb_insert_color(&amp;dev-&gt;node, root);
+    <span class="kw">return</span> 0;
+}
+
+<span class="kw">static</span> <span class="type">int</span> __init bt_rb_init(<span class="type">void</span>)
+{
+    <span class="type">int</span> i;
+    <span class="type">int</span> ids[] = { 30, 10, 50, 20, 40 };   <span class="com">// 故意乱序</span>
+    <span class="kw">struct</span> bt_dev *dev;
+
+    pr_info(<span class="str">"bt_rb: 加载,按乱序插入 {30,10,50,20,40}\n"</span>);
+    <span class="kw">for</span> (i = 0; i &lt; 5; i++) {
+        dev = kzalloc(<span class="kw">sizeof</span>(*dev), GFP_KERNEL);
+        <span class="kw">if</span> (!dev) <span class="kw">return</span> -ENOMEM;
+        dev-&gt;id = ids[i];
+        scnprintf(dev-&gt;name, <span class="kw">sizeof</span>(dev-&gt;name), <span class="str">"BT-%d"</span>, ids[i]);
+        bt_insert(&amp;bt_tree, dev);
+    }
+
+    <span class="com">// 中序遍历:rb_first + rb_next,应得到升序</span>
+    pr_info(<span class="str">"bt_rb: 中序遍历(应为升序):\n"</span>);
+    <span class="kw">struct</span> rb_node *n;
+    <span class="kw">for</span> (n = rb_first(&amp;bt_tree); n; n = rb_next(n)) {
+        <span class="kw">struct</span> bt_dev *d = container_of(n, <span class="kw">struct</span> bt_dev, node);
+        pr_info(<span class="str">"  - id=%d %s\n"</span>, d-&gt;id, d-&gt;name);
+    }
+    <span class="kw">return</span> 0;
+}
+
+<span class="kw">static</span> <span class="type">void</span> __exit bt_rb_exit(<span class="type">void</span>)
+{
+    <span class="kw">struct</span> rb_node *n, *tmp;
+    <span class="kw">for</span> (n = rb_first(&amp;bt_tree); n; n = tmp) {
+        tmp = rb_next(n);                   <span class="com">// 先记下后继,再删当前</span>
+        <span class="kw">struct</span> bt_dev *d = container_of(n, <span class="kw">struct</span> bt_dev, node);
+        rb_erase(n, &amp;bt_tree);
+        kfree(d);
+    }
+    pr_info(<span class="str">"bt_rb: 卸载\n"</span>);
+}
+
+module_init(bt_rb_init);
+module_exit(bt_rb_exit);
+MODULE_LICENSE(<span class="str">"GPL"</span>);
+MODULE_DESCRIPTION(<span class="str">"Lesson 3: real kernel rbtree demo"</span>);</code></pre>
+
+  <p><strong>跑起来</strong>(Makefile 同前两课,把 <code>obj-m</code> 改成 <code>bt_rbtree.o</code>)</p>
+
+  <ol class="steps">
+    <li><code>make</code> → <code>bt_rbtree.ko</code></li>
+    <li><code>sudo insmod bt_rbtree.ko</code></li>
+    <li><code>dmesg | tail</code> —— 中序遍历应输出 <code>id=10, 20, 30, 40, 50</code>(升序),即使插入顺序是乱的</li>
+    <li><code>sudo rmmod bt_rbtree</code></li>
+  </ol>
+
+  <aside class="callout tip">
+    <span class="callout-title">观察重点</span>
+    你插入的顺序是 {30,10,50,20,40},遍历输出却是 {10,20,30,40,50}——这就是"二叉搜索树中序有序"。
+    而 rbtree 保证这棵树在乱序插入后依然<strong>近似平衡</strong>,所以每次插入都是 O(log n) 而非退化成 O(n) 链。
+    你可以在加载后查 <code>/proc/kallsyms</code> 里 <code>rb_insert_color</code> 确认它确实被调用了。
+  </aside>
+
+
+  <h2 id="check">检验理解</h2>
+
+  <div class="quiz" data-correct="c" data-explain="内核 rbtree 只提供节点结构 + 平衡算法(rb_insert_color/rb_erase),比较、查找、定位插入位置都由使用者自己写。理由是泛型方案(如带函数指针的比较)会引入间接调用开销,在热路径上不可接受;不同子系统键类型各异,难统一。侵入式与 container_of 是它沿用 list_head 的方式,不是'不提供 insert'的原因。">
+    <p class="quiz-q">为什么内核 rbtree 不直接提供 rbtree_insert(tree, key, value) 这种现成接口?</p>
+    <label class="quiz-opt"><input type="radio" name="q1" value="a">因为不支持泛型编程</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="b">为了避免侵入式结构耦合</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="c">为避免热路径间接调用开销</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="d">因为 container_of 无法实现</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="b" data-explain="6.6 起 EEVDF 取代了 CFS,但 rbtree 没换:tasks_timeline 这棵 rb_root_cached 仍在 cfs_rq 里,sched_entity 仍嵌 rb_node。变的是排序键——从 vruntime 改成虚拟截止时间。说'rbtree 没了''仍按 vruntime'都不对。这正是内核版本演进、术语需跟版本走的典型例子。">
+    <p class="quiz-q">关于你的 6.6 内核里进程调度器与 rbtree,哪个说法是对的?</p>
+    <label class="quiz-opt"><input type="radio" name="q2" value="a">不再用 rbtree,改成了哈希表</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="b">仍用 rbtree,但改按虚拟截止时间排</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="c">仍用 rbtree,仍按 vruntime 排</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="d">改用 maple tree 组织就绪队列</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+
+  <h2 id="next">知识储备篇小结 + 接下来</h2>
+
+  <p>
+    到这里,你集齐了内核<strong>关系型数据结构</strong>的三件套:
+  </p>
+
+  <table>
+    <thead><tr><th>结构</th><th>擅长</th><th>典型场景</th></tr></thead>
+    <tbody>
+      <tr><td>list_head</td><td>通用双向链表,O(1) 增删</td><td>进程链、页面 LRU</td></tr>
+      <tr><td>hlist</td><td>省内存的哈希桶头</td><td>哈希表冲突链</td></tr>
+      <tr><td>rbtree</td><td>有序集合,O(log n) 查找/最值</td><td>调度器、定时器、ext4 区段</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    这三件套覆盖了内核里<strong>"对象之间怎么互相找"</strong>的绝大部分。从下一课起,
+    我们离开"数据结构"这个地基,进入第 3 章的<strong>中断</strong>——这是你 MCU 经验能大规模迁移、
+    又必须重新理解内核分工的部分(上半部/下半部、软中断、tasklet)。
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">推荐精读</span>
+    官方文档 <a href="https://docs.kernel.org/core-api/rbtree.html" target="_blank" rel="noopener">Red-black Trees (rbtree) in Linux</a>(kernel.org)——
+    正是本课的权威依据,有完整的插入/删除示例和"augmented rbtree"进阶。
+    关于 EEVDF,读官方 <a href="https://docs.kernel.org/scheduler/sched-eevdf.html" target="_blank" rel="noopener">EEVDF Scheduler</a> 和
+    LWN 的 <a href="https://lwn.net/Articles/925371/" target="_blank" rel="noopener">An EEVDF CPU scheduler for Linux</a>。
+    maple tree 见 LWN <a href="https://lwn.net/Articles/901714/" target="_blank" rel="noopener">Introducing the Maple Tree</a>。
+  </aside>
+
+  <h3>带着这些问题进入下一课(中断)</h3>
+  <ul>
+    <li><strong>MCU 里你写 ISR 时,在 ISR 里能做什么、不能做什么?Linux 内核 ISR 的限制一样吗?</strong></li>
+    <li><strong>为什么 Linux 要把中断处理拆成"上半部/下半部"两半?MCU 上你这么拆过吗?</strong></li>
+    <li><strong>软中断、tasklet、工作队列——三种"下半部"机制,什么时候用哪个?</strong></li>
+  </ul>
+
+  <p class="lesson-nav">
+    <a href="0002-hlist-hash-list.html">← 第 2 课:hlist</a>
+    <a href="#">第 4 课:中断(待生成)→</a>
+  </p>
+
+  <hr>
+  <p style="font-family:var(--sans);font-size:.85rem;color:var(--ink-mute);">
+    两个 quiz、实验跑通后,<strong>回来告诉我</strong>:中序遍历输出对不对?那个 <code>__rb_parent_color</code>
+    把颜色塞进指针低位的小技巧,你以前见过吗?这些反馈决定第 4 课(中断)的深浅。
+  </p>
+
+</div>
+</body>
+</html>
