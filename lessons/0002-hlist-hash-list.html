@@ -128,7 +128,7 @@
     那它就和其他节点（存 <code>hlist_node*</code>）类型不一致，每次删除都得判断"我是不是第一个节点"。
   </p>
 
-  <p>内核的解法极其优雅：<strong>让 pprev 指向"指向我的那个指针本身"</strong>，而不是指向我前面的节点。</p>
+  <p>内核的解法极其优雅：<strong>让 pprev 不存"前一个节点的地址"，而存"前一个节点里那个指向我的指针字段的地址"</strong>。</p>
 
   <div class="memfig">第一个节点：pprev 指向桶头的 first 字段
 
@@ -365,12 +365,12 @@ MODULE_DESCRIPTION(<span class="str">"Lesson 2: hlist hash table demo"</span>);<
   <ul>
     <li><strong>内核红黑树为什么是"手写"的，不像链表那样提供现成的插入/删除函数？</strong>——这引出 rbtree 的设计哲学。</li>
     <li><strong>哈希表的桶数怎么选？</strong>——引出负载因子与内核哈希宏的选择策略。</li>
-    <li><strong>除了 list/hlist/rbtree，内核还有哪些"关系型"结构？</strong>——引出 xarray、基数树（进程地址空间用）。</li>
+    <li><strong>除了 list/hlist/rbtree，内核还有哪些"关系型"结构？</strong>——引出 xarray，以及 6.1 起取代 VMA 红黑树的 maple tree（第 3 课会展开）。</li>
   </ul>
 
   <p class="lesson-nav">
     <a href="0001-intrusive-list-head.html">← 第 1 课：list_head</a>
-    <a href="#">第 3 课（待生成）→</a>
+    <a href="0003-rbtree.html">第 3 课：红黑树 rbtree →</a>
   </p>
 
   <hr>
