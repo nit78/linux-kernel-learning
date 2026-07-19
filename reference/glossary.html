@@ -55,7 +55,7 @@
   <h1>术语表（Glossary）</h1>
   <p class="lesson-meta">
     <span class="chip">随课程扩充</span>
-    <span class="chip">已收录 19 条</span>
+    <span class="chip">已收录 24 条</span>
     <a href="../lessons/0001-intrusive-list-head.html">← 回到第 1 课</a>
   </p>
   <p class="glossary-intro">
@@ -246,6 +246,54 @@
       一种 RCU 安全、基于 B 树、缓存友好的<strong>区间树</strong>，专为存储非重叠地址区间设计。
       6.1 起用它取代了 <code>mm_struct</code> 里组织 VMA 的 rbtree + 链表（<code>mm_mt</code> 字段）。
       6.6 迁移完成。<span class="avoid">避免再说"VMA 用红黑树"——6.1 起已过时。注意：调度器仍用 rbtree，maple tree 只取代了 VMA 那处。</span>
+    </dd>
+  </dl>
+
+  <p class="group-label">中断与延迟执行（第 4 课）</p>
+
+  <dl class="gloss">
+    <dt>进程上下文 / 中断上下文 <span class="en">process context / interrupt context</span></dt>
+    <dd>
+      内核代码运行时所处的两种"身份"。<strong>进程上下文</strong>：代表某进程执行（如系统调用、workqueue 工作函数、threaded IRQ 的线程），
+      有 <code>current</code> 指向一个真实 <code>task_struct</code>，<strong>可以睡眠、可以持有 mutex</strong>。
+      <strong>中断上下文</strong>：硬中断 ISR、softirq、tasklet——<strong>不属于任何进程</strong>，<code>current</code> 只是"借住"在被打断的进程上，
+      <strong>绝对不能睡眠</strong>。判断当前在哪种上下文是写驱动最基本的能力。
+    </dd>
+
+    <dt>硬中断 / 上半部 <span class="en">hardirq / top half</span></dt>
+    <dd>
+      硬件触发的中断服务程序（ISR），由 <code>request_irq</code>/<code>request_threaded_irq</code> 的 handler 参数注册。
+      跑在中断上下文，不能睡眠，只做最紧急的事（应答中断、拷贝数据、唤醒下半部），尽快返回以重新开放中断。
+    </dd>
+
+    <dt>softirq <span class="en">software interrupt</span></dt>
+    <dd>
+      内核内部使用的低延迟延迟执行机制，跑在中断上下文（不可睡眠）。向量在编译期固定（NET_RX、NET_TX、TIMER、RCU 等），
+      驱动极少直接使用。tasklet 建在它之上（占两个 softirq 向量）。
+      <span class="avoid">避免与"信号"（signal，用户态异步通知）混淆；避免与"软中断（x86 INT 指令）"混淆。</span>
+    </dd>
+
+    <dt>tasklet <span class="en">tasklet</span></dt>
+    <dd>
+      建在 softirq 之上的延迟执行机制，跑在中断上下文、不可睡眠。<strong>2024 年起正式废弃</strong>（LWN: The end of tasklets），
+      内核正在把 in-tree 驱动从 tasklet 迁到 BH workqueue 或 threaded IRQ。
+      <span class="avoid">新代码不要用；但移植/读老驱动时仍会大量见到，要能看懂。</span>
+    </dd>
+
+    <dt>workqueue / 工作队列 <span class="en">workqueue</span></dt>
+    <dd>
+      延迟执行机制，工作函数跑在<strong>进程上下文</strong>（内核线程），<strong>可以睡眠、持有 mutex、做 I/O</strong>。
+      现代 API：<code>alloc_workqueue(name, flags, max_active)</code> 创建队列，<code>INIT_WORK</code>/<code>INIT_DELAYED_WORK</code> 初始化工作，
+      <code>queue_work</code>/<code>queue_delayed_work</code> 提交。是驱动下半部最常用的机制。
+      卸载时必须 <code>cancel_work_sync</code> / <code>cancel_delayed_work_sync</code> 取消未决工作，否则 oops。
+    </dd>
+
+    <dt>threaded IRQ / 线程化中断 <span class="en">threaded interrupt handler</span></dt>
+    <dd>
+      由 <code>request_threaded_irq(irq, handler, thread_fn, ...)</code> 注册的中断处理模型：
+      handler（上半部）只屏蔽中断 + 唤醒一个内核线程并返回 <code>IRQ_WAKE_THREAD</code>；
+      thread_fn（下半部）跑在<strong>进程上下文</strong>，可睡眠、可做 I/O（如 I²C/SPI 读寄存器）。
+      现代驱动首选，尤其当中断处理需要睡眠时。<code>request_irq</code> 自 ~4.5 起只是 thread_fn=NULL 的 <code>request_threaded_irq</code>。
     </dd>
   </dl>
 
