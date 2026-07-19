@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 4 课 · 中断与延迟执行</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/quiz.js" defer></script>
+<script src="../assets/notes.js" defer></script>
+<style>
+  .flowfig {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1.3rem 0;
+    color: var(--ink);
+  }
+  .flowfig .dim { color: var(--ink-mute); }
+  .flowfig .hl  { color: var(--accent); font-weight: 600; }
+  .flowfig .ok  { color: var(--ok); font-weight: 600; }
+  .flowfig .err { color: var(--err); font-weight: 600; }
+  .mech-tbl td:nth-child(1) { width: 16%; font-weight: 600; }
+  .mech-tbl td:nth-child(2) { width: 14%; font-family: var(--mono); font-size: .85rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="lesson-meta">
+    <span class="chip">第 4 课</span>
+    <span class="chip">知识储备篇 · §3 中断</span>
+    <span class="chip">Linux 6.6 (你的环境)</span>
+    <a href="../reference/glossary.html">术语表</a>
+  </p>
+
+  <h1>中断与延迟执行：从 MCU ISR 到内核的"上下文分工"</h1>
+
+  <p>
+    这是你的 MCU 经验<strong>大规模迁移</strong>的一课。裸机里你写 ISR,内核里你也写 ISR——
+    但内核多了一层必须理解的分工:<strong>上半部 / 下半部</strong>。
+    不懂它,后面所有驱动(包括你移植过的蓝牙/WiFi)都只能停在"照搬"层面。
+  </p>
+
+  <aside class="callout tip">
+    <span class="callout-title">本课的两个版本纠偏</span>
+    老书/老博客常讲 <code>tasklet</code>,但<strong>6.6 起 tasklet 已废弃</strong>(2024 "end of tasklets" 计划)。
+    本课会告诉你现状,并给你该用的替代。<code>request_irq</code> 自 4.5 起其实只是
+    <code>request_threaded_irq</code> 的包装——这两个点很多人讲错。
+  </aside>
+
+
+  <h2 id="why-split">为什么内核要拆"两半"</h2>
+
+  <p>先回到你熟悉的 MCU 场景,做一次对照:</p>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>MCU / 裸机 ISR</h4>
+      <p>硬件触发 → CPU 跳进你的 ISR → 你在 ISR 里<strong>把事干完</strong>(读寄存器、清标志、更新状态、可能还塞个队列)→ 返回。</p>
+      <p>整个过程中,<strong>通常中断是关着的</strong>(或同级中断被屏蔽)。ISR 干多久,别的中断就等多久。</p>
+      <p>所以你被训练成:ISR 越短越好,绝不调用阻塞函数。</p>
+    </div>
+    <div class="col">
+      <h4>Linux 内核 ISR</h4>
+      <p>同样的约束依然成立(甚至更严):<strong>硬中断 ISR 跑在"中断上下文",不能睡眠、不能持有锁等很久</strong>。</p>
+      <p>但内核要处理的事很多(I/O 协议栈、唤醒进程、网络栈),塞进 ISR 会把所有中断延迟拖死。</p>
+      <p>内核的解法:<strong>ISR 只做最紧急的几纳秒,剩下的活推迟到"下半部"</strong>——开中断后再慢慢干。</p>
+    </div>
+  </div>
+
+  <p>于是内核的中断处理在时间轴上分成两段:</p>
+
+  <div class="flowfig">一次设备中断的时间轴
+
+  时间 ──────────────────────────────────────────────────────→
+
+  ┌─────────────────┐ ╔═════════════════════════╗
+  │  <span class="hl">上半部 (硬中断 ISR)</span> │ ║    <span class="ok">下半部 (延迟执行)</span>      ║
+  │  - 应答中断       │ ║  - 协议解析、唤醒进程      ║
+  │  - 拷贝数据到 RAM │ ║  - 访问可能睡眠的资源      ║
+  │  - <span class="err">不可睡眠</span>        │ ║  - <span class="ok">可睡眠</span>(取决于机制)      ║
+  │  - <span class="dim">中断(部分)关闭</span>   │ ║  - <span class="dim">中断已重新打开</span>         ║
+  └─────────────────┘ ╚═════════════════════════╝
+        ↑ irq_handler()        ↑ softirq / workqueue / thread_fn
+
+  <span class="dim">ISR 极短 → 尽快重新开中断 → 系统响应能力不被拖垮。</span></div>
+
+  <p>这就是"为什么拆"的根本原因:<strong>让 CPU 尽快回到"能接受新中断"的状态</strong>。
+  上半部越短,中断延迟越低,实时性越好。下半部承担"重活",且可以选择在更宽松的环境里跑。</p>
+
+
+  <h2 id="four-mechanisms">下半部的四种机制</h2>
+
+  <p>这是本课的"选型表",你以后写驱动反复要回来查。内核给了四种延迟执行机制,各有能力边界:</p>
+
+  <table class="mech-tbl">
+    <thead><tr>
+      <th>机制</th><th>API</th><th>运行上下文</th><th>能睡眠?</th><th>何时用</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>softirq</strong></td>
+        <td><code>open_softirq</code> / <code>raise_softirq</code></td>
+        <td>中断上下文(软中断)</td>
+        <td><span class="err">否</span></td>
+        <td>极低延迟、高频、且对时序敏感的内核子系统(网络 TX/RX、RCU、定时器)。驱动极少自己开 softirq——只有编译期固定的几种。</td>
+      </tr>
+      <tr>
+        <td><strong>tasklet</strong><br><small style="color:var(--err)">⚠ 已废弃</small></td>
+        <td><code>DECLARE_TASKLET</code> 等</td>
+        <td>中断上下文(建在 softirq 之上)</td>
+        <td><span class="err">否</span></td>
+        <td><strong>新代码不要用</strong>。移植老驱动会看到。替代:workqueue 或 threaded IRQ。</td>
+      </tr>
+      <tr>
+        <td><strong>workqueue</strong></td>
+        <td><code>alloc_workqueue</code> / <code>INIT_WORK</code> / <code>queue_work</code></td>
+        <td><strong>进程上下文</strong>(内核线程)</td>
+        <td><span class="ok">能</span></td>
+        <td>需要睡眠、分配内存、持有互斥锁、做 I/O 的"下半部"。驱动最常用。</td>
+      </tr>
+      <tr>
+        <td><strong>threaded IRQ</strong></td>
+        <td><code>request_threaded_irq</code></td>
+        <td>hardirq 只做最少事 + 内核<strong>线程</strong></td>
+        <td><span class="ok">能(在线程里)</span></td>
+        <td>中断处理本身就需要睡眠(如 I²C/SPI 总线读寄存器)的场景。现代驱动首选。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <aside class="callout warn">
+    <span class="callout-title">关于 tasklet 的真相(6.6 现状)</span>
+    <p>
+      <strong>tasklet 自 2024 年起正式废弃</strong>(LWN: <a href="https://lwn.net/Articles/960041/" target="_blank" rel="noopener">The end of tasklets</a>)。
+      内核正在把所有 in-tree 驱动从 tasklet 迁到 <strong>BH workqueue</strong> 或 threaded IRQ。
+      tasklet 建在 softirq 之上(占用两个 softirq 向量),但<strong>softirq 本身不在移除清单</strong>——
+      被废弃的是 tasklet 这一层 API,不是 softirq。
+    </p>
+    <p><strong>给你的实操建议</strong>:</p>
+    <ul>
+      <li>读老驱动(尤其 5.x 之前)大量见到 tasklet——要能看懂,知道它在 softirq 里跑、不能睡眠。</li>
+      <li>自己写新驱动:<strong>别用 tasklet</strong>。需要睡眠 → workqueue 或 threaded IRQ;不需要睡眠、追求低延迟 → 考虑 softirq(但驱动很少自己开)。</li>
+    </ul>
+  </aside>
+
+
+  <h2 id="context-rule">铁律:能不能睡觉,看"上下文"</h2>
+
+  <p>整章的精华,浓缩成一张判断表。以后你写驱动调任何 API 前,先问<strong>"我现在在什么上下文"</strong>:</p>
+
+  <table>
+    <thead><tr><th>上下文</th><th>典型入口</th><th>能睡眠?</th><th>能持有 mutex?</th></tr></thead>
+    <tbody>
+      <tr><td><strong>硬中断</strong>(top half / hardirq)</td><td><code>irq_handler_t</code></td><td><span class="err">❌ 绝不</span></td><td><span class="err">❌</span></td></tr>
+      <tr><td><strong>软中断</strong>(softirq / tasklet / NAPI)</td><td>softirq 回调、tasklet func</td><td><span class="err">❌</span></td><td><span class="err">❌(只能用 spinlock)</span></td></tr>
+      <tr><td><strong>进程上下文</strong>(workqueue / 线程化 IRQ / 系统调用)</td><td>work_func、thread_fn、syscall</td><td><span class="ok">✅ 可以</span></td><td><span class="ok">✅</span></td></tr>
+    </tbody>
+  </table>
+
+  <aside class="callout">
+    <span class="callout-title">为什么硬中断不能睡眠</span>
+    <p>
+      睡眠 = 让出 CPU 等某个事件(如 I/O 完成)。但硬中断<strong>不属于任何进程</strong>,调度器没有可"挂起"的对象;
+      而且睡眠会让中断长期关着,整个系统的中断响应崩盘。这条规则没有例外,违反了就是 oops/死锁。
+    </p>
+    <p>这也解释了为什么 workqueue/threaded IRQ 这么重要:它们<strong>在进程上下文跑</strong>,把"中断触发的重活"搬进能睡眠的世界。</p>
+  </aside>
+
+
+  <h2 id="api">真实 API:注册中断</h2>
+
+  <pre><code><span class="com">// include/linux/interrupt.h</span>
+<span class="kw">int</span> request_threaded_irq(<span class="type">unsigned</span> <span class="type">int</span> irq,
+                          irq_handler_t handler,      <span class="com">// 上半部(可为 NULL)</span>
+                          irq_handler_t thread_fn,    <span class="com">// 下半部线程函数</span>
+                          <span class="type">unsigned</span> <span class="type">long</span> irqflags,
+                          <span class="kw">const</span> <span class="type">char</span> *devname,
+                          <span class="type">void</span> *dev_id);
+
+<span class="com">// 你熟悉的 request_irq 其实是它的包装(自 ~4.5 起):</span>
+<span class="kw">static</span> <span class="kw">inline</span> <span class="type">int</span> __must_check
+request_irq(<span class="type">unsigned</span> <span class="type">int</span> irq, irq_handler_t handler,
+            <span class="type">unsigned</span> <span class="type">long</span> flags, <span class="kw">const</span> <span class="type">char</span> *name, <span class="type">void</span> *dev)
+{
+    <span class="kw">return</span> request_threaded_irq(irq, handler, <span class="kw">NULL</span>, flags, name, dev);
+    <span class="com">                                                ↑↑↑ thread_fn=NULL → 不线程化</span>
+}</code></pre>
+
+  <p>线程化中断的执行流程,画出来就懂:</p>
+
+  <div class="flowfig">request_threaded_irq 的一次中断处理
+
+  硬件中断 ──→ [handler 上半部]   只做:屏蔽本中断 + 唤醒内核线程 + 返回 IRQ_WAKE_THREAD
+                     │
+                     ↓  (中断立即重新打开,系统照常响应别的中断)
+                [thread_fn 下半部]  在专属内核线程里跑,可睡眠、可持有 mutex、可做 I/O
+                     │
+                     ↓
+                  处理完毕,清除中断屏蔽,等下次
+
+  <span class="dim">关键收益:中断被屏蔽的时间 = handler 那"几纳秒",而不是整个处理时间。</span></div>
+
+  <h3>handler / thread_fn 的返回值(常考点)</h3>
+  <table>
+    <thead><tr><th>返回值</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>IRQ_HANDLED</code></td><td>处理完了。</td></tr>
+      <tr><td><code>IRQ_NONE</code></td><td>不是我的中断(共享中断时用来统计噪声)。</td></tr>
+      <tr><td><code>IRQ_WAKE_THREAD</code></td><td><strong>上半部专用</strong>:告诉子系统"去调度我的 thread_fn"。线程化 IRQ 的标准返回。</td></tr>
+    </tbody>
+  </table>
+
+
+  <h2 id="lab">动手实验:workqueue 自调度(WSL2 可跑)</h2>
+
+  <aside class="callout warn">
+    <span class="callout-title">关于 WSL2 的限制(诚实声明)</span>
+    <p>
+      你的环境是 WSL2 + 6.6.87.2——<strong>没有真实硬件中断</strong>,不能注册一个 GPIO/PCI 中断然后等它触发。
+      所以本课实验<strong>不模拟硬件中断</strong>,而是聚焦在<strong>下半部机制本身</strong>:用 workqueue 做周期性任务 + 自调度,
+      这是你在驱动里反复要写的模式(中断来一次 → work 排一次 → work 里又把自己排进去做下一轮)。
+    </p>
+    <p>真实硬件 IRQ 的实验(注册 GPIO 中断、用 <code>request_threaded_irq</code> 处理真实设备)需要真机或带 USB 透传的虚拟机——留给以后。</p>
+  </aside>
+
+  <p><strong>实验目标</strong>:写一个 <code>.ko</code>,加载时启动一个 workqueue 延迟任务,它每秒把自己重排一次,打印计数,共跑 5 次后自停。你会亲手用到 <code>alloc_workqueue</code> / <code>INIT_DELAYED_WORK</code> / <code>queue_delayed_work</code>。</p>
+
+  <pre><code><span class="com">// bt_work.c — 第 4 课实验:workqueue 延迟自调度(WSL2 可跑)</span>
+<span class="kw">#include</span> &lt;linux/module.h&gt;
+<span class="kw">#include</span> &lt;linux/kernel.h&gt;
+<span class="kw">#include</span> &lt;linux/workqueue.h&gt;
+
+<span class="kw">static</span> <span class="kw">struct</span> workqueue_struct *bt_wq;
+<span class="kw">static</span> <span class="kw">struct</span> delayed_work      bt_dwork;
+<span class="kw">static</span> <span class="type">unsigned</span> <span class="type">int</span>               bt_tick;
+
+<span class="com">/* 下半部函数:跑在进程上下文,可以睡眠(这里不睡,只演示) */</span>
+<span class="kw">static</span> <span class="type">void</span> bt_work_fn(<span class="kw">struct</span> work_struct *work)
+{
+    bt_tick++;
+    pr_info(<span class="str">"bt_work: tick %u (跑在进程上下文,pid=%d,可睡眠)\n"</span>,
+            bt_tick, current-&gt;pid);
+
+    <span class="kw">if</span> (bt_tick &lt; 5) {
+        <span class="com">/* 自调度:1 秒后再排一次自己 */</span>
+        queue_delayed_work(bt_wq, &amp;bt_dwork, msecs_to_jiffies(1000));
+    } <span class="kw">else</span> {
+        pr_info(<span class="str">"bt_work: 完成 5 轮,停止自调度\n"</span>);
+    }
+}
+
+<span class="kw">static</span> <span class="type">int</span> __init bt_work_init(<span class="type">void</span>)
+{
+    pr_info(<span class="str">"bt_work: 加载\n"</span>);
+    bt_wq = alloc_workqueue(<span class="str">"bt_wq"</span>, 0, 0);   <span class="com">// 0,0 = 默认 flags + 默认 max_active</span>
+    <span class="kw">if</span> (!bt_wq) <span class="kw">return</span> -ENOMEM;
+
+    INIT_DELAYED_WORK(&amp;bt_dwork, bt_work_fn);
+    bt_tick = 0;
+    queue_delayed_work(bt_wq, &amp;bt_dwork, msecs_to_jiffies(1000));  <span class="com">// 1 秒后启动</span>
+    <span class="kw">return</span> 0;
+}
+
+<span class="kw">static</span> <span class="type">void</span> __exit bt_work_exit(<span class="type">void</span>)
+{
+    <span class="com">/* 卸载前必须取消未决的 work,否则 work_func 访问已释放的资源会 oops */</span>
+    cancel_delayed_work_sync(&amp;bt_dwork);
+    destroy_workqueue(bt_wq);
+    pr_info(<span class="str">"bt_work: 卸载\n"</span>);
+}
+
+module_init(bt_work_init);
+module_exit(bt_work_exit);
+MODULE_LICENSE(<span class="str">"GPL"</span>);
+MODULE_DESCRIPTION(<span class="str">"Lesson 4: workqueue self-rescheduling demo"</span>);</code></pre>
+
+  <p><strong>跑起来</strong>(Makefile 同前几课,<code>obj-m := bt_work.o</code>):</p>
+  <ol class="steps">
+    <li><code>make</code> → <code>bt_work.ko</code></li>
+    <li><code>sudo insmod bt_work.ko</code></li>
+    <li>等 5 秒,期间 <code>dmesg | tail</code> 观察:应看到每秒一条 tick,共 5 条,然后"完成 5 轮"</li>
+    <li>注意 pid:work 函数的 <code>current-&gt;pid</code> 是 <code>bt_wq</code> 这个内核线程的 pid,<strong>不是 insmod 进程</strong>——这就是"进程上下文"的可观察证据</li>
+    <li><code>sudo rmmod bt_work</code></li>
+  </ol>
+
+  <aside class="callout tip">
+    <span class="callout-title">观察重点(也是真正的学习点)</span>
+    <p>
+      <strong>1. <code>current-&gt;pid</code> 不是 insmod 的 pid</strong> —— 说明 work 函数确实跑在一个独立的内核线程里(进程上下文),而非调用者上下文。
+      这是你以后理解"中断下半部为何能睡眠"的第一手证据。
+    </p>
+    <p>
+      <strong>2. <code>cancel_delayed_work_sync</code> 不能省</strong> —— 卸载时若 work 正在排队或执行,不取消就 <code>destroy_workqueue</code>,
+      work 醒来访问已释放代码 = oops。这个取消模式你以后在所有驱动 <code>remove</code> 路径都会写。
+    </p>
+  </aside>
+
+
+  <h2 id="check">检验理解</h2>
+
+  <div class="quiz" data-correct="b" data-explain="硬中断 ISR 在中断上下文执行,不属于任何进程,调度器没有可挂起的对象;且睡眠会让中断长期关闭,拖垮整个系统响应。workqueue 在进程上下文(内核线程)跑,threaded IRQ 的 thread_fn 也是进程上下文,所以二者都可睡眠。'处理越快越好'是普遍原则但非硬性禁令。">
+    <p class="quiz-q">硬中断 ISR 不能睡眠的根本原因是什么?下列哪个机制能把"中断触发的重活"搬进可睡眠的环境?</p>
+    <label class="quiz-opt"><input type="radio" name="q1" value="a">ISR 必须处理得越快越好</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="b">中断上下文无进程可挂起;用 workqueue / threaded IRQ</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="c">ISR 里没有 current 指针;只能用 tasklet</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="d">ISR 占用 CPU 锁;只能用 softirq</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="c" data-explain="tasklet 自 2024 年起正式废弃(LWN: The end of tasklets),内核正在把驱动从 tasklet 迁到 BH workqueue 或 threaded IRQ。但 softirq 本身不在移除清单(被废弃的只是建在 softirq 之上的 tasklet 那层 API)。新代码应避免 tasklet;移植老驱动时会见到,要能看懂。'6.6 已完全移除'不对,API 仍在。">
+    <p class="quiz-q">关于你的 6.6 内核里的延迟执行机制,哪个说法是对的?</p>
+    <label class="quiz-opt"><input type="radio" name="q2" value="a">tasklet 是首选,新驱动应优先使用</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="b">softirq 也即将被移除</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="c">tasklet 已废弃,新代码用 workqueue / threaded IRQ</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="d">tasklet 在 6.6 已完全移除</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+
+  <h2 id="next">接下来</h2>
+
+  <p>
+    到这里你掌握了内核中断的<strong>分工模型</strong>:上半部极速、下半部可重。这是后续所有驱动——
+    包括你熟悉的蓝牙/WiFi——的运行骨架。下一课是知识储备篇最后一站:<strong>时间子系统</strong>(§4):
+    <code>jiffies</code> / <code>HZ</code> / <code>hrtimer</code>,以及为什么内核有"低精度"和"高精度"两套定时器。
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">推荐精读</span>
+    <ul style="margin-bottom:0">
+      <li>官方文档:<a href="https://docs.kernel.org/core-api/genericirq.html" target="_blank" rel="noopener">Generic IRQ Handling</a>、<a href="https://docs.kernel.org/core-api/workqueue.html" target="_blank" rel="noopener">Concurrency Managed Workqueue (cmwq)</a></li>
+      <li>LWN 必读:<a href="https://lwn.net/Articles/960041/" target="_blank" rel="noopener">The end of tasklets</a>(2024,tasklet 废弃始末)、<a href="https://lwn.net/Articles/302043/" target="_blank" rel="noopener">Moving Interrupts to Threads</a>(threaded IRQ 的来历)</li>
+      <li>本书 §3「中断」对应章节,图解 ISR 注册与软中断流程</li>
+    </ul>
+  </aside>
+
+  <h3>带着这些问题进入下一课(时间)</h3>
+  <ul>
+    <li><strong>MCU 上你用 SysTick/定时器中断做的周期任务,内核里对应的是什么?</strong></li>
+    <li><strong><code>jiffies</code> 和 <code>HZ</code> 的关系?为什么 <code>msecs_to_jiffies</code> 在内核代码里到处都是?</strong></li>
+    <li><strong>hrtimer 跟普通 timer 有什么本质区别?为什么需要两套?</strong></li>
+  </ul>
+
+  <p class="lesson-nav">
+    <a href="0003-rbtree.html">← 第 3 课:红黑树</a>
+    <a href="#">第 5 课:时间子系统(待生成)→</a>
+  </p>
+
+  <hr>
+  <p style="font-family:var(--sans);font-size:.85rem;color:var(--ink-mute);">
+    实验跑通后,<strong>回来告诉我</strong>:<code>current-&gt;pid</code> 的输出跟你预期一致吗?
+    "硬中断不能睡眠"那条铁律,你以前在 MCU 上踩过坑吗?这些反馈决定第 5 课(时间子系统)的深浅。
+    <br><br>
+    💡 提示:读课时遇到不懂的,用<strong>右下角笔记按钮</strong>(或选中那句话弹出的"+ 记为笔记")记下来,
+    搜明白后填进去——这正是笔记功能的设计用途。
+  </p>
+
+</div>
+</body>
+</html>
