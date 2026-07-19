@@ -30,6 +30,7 @@
 ## 教学组件复用约定
 - 所有 HTML（lesson / reference）共享 `../assets/style.css`。
 - 测验统一用 `../assets/quiz.js`，quiz 答案选项**等长**（不漏线索）。
+- 笔记统一用 `../assets/notes.js`（LR-0004）：右下角悬浮按钮开关抽屉；选中正文文字 → 弹"+ 记为笔记" → 自动引用选中内容；支持编辑/删除/导出 JSON/导入/复制为 Markdown。笔记存于浏览器 localStorage，按课隔离（key = `lkl-notes:<文件名>`）。
 - 每课必须链接到 `reference/glossary.html` 和相邻课程，推荐一个精读源。
 
 ## 待观察 / 待确认
