@@ -28,6 +28,75 @@
   .flowfig .err { color: var(--err); font-weight: 600; }
   .mech-tbl td:nth-child(1) { width: 16%; font-weight: 600; }
   .mech-tbl td:nth-child(2) { width: 14%; font-family: var(--mono); font-size: .85rem; }
+  /* softirq 两种触发路径的对比卡片 */
+  .ctx-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin: 1.3rem 0;
+  }
+  .ctx-card {
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--ink-mute);
+    border-radius: 4px;
+    padding: .9rem 1rem;
+    background: var(--code-bg);
+  }
+  .ctx-card.primary { border-left-color: var(--accent); }
+  .ctx-card .ctx-tag {
+    display: inline-block;
+    font-family: var(--sans);
+    font-size: .72rem;
+    font-weight: 600;
+    color: var(--paper);
+    background: var(--ink-mute);
+    border-radius: 3px;
+    padding: 1px 7px;
+    margin-bottom: .5rem;
+    letter-spacing: .03em;
+  }
+  .ctx-card.primary .ctx-tag { background: var(--accent); }
+  .ctx-card .ctx-title {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: .92rem;
+    margin: 0 0 .55rem;
+    color: var(--ink);
+  }
+  .ctx-card .ctx-chain {
+    font-family: var(--mono);
+    font-size: .76rem;
+    line-height: 1.55;
+    color: var(--ink-soft);
+    background: var(--paper);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: .45rem .55rem;
+    margin: 0 0 .6rem;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  .ctx-card .ctx-row {
+    font-family: var(--mono);
+    font-size: .78rem;
+    line-height: 1.6;
+    margin: 0;
+  }
+  .ctx-card .ctx-row b { color: var(--ink); font-weight: 600; }
+  .ctx-card .ctx-row .same { color: var(--ok); font-weight: 600; }
+  .ctx-card .ctx-row .diff { color: var(--err); font-weight: 600; }
+  .ctx-conclude {
+    font-family: var(--sans);
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: .8rem 1rem;
+    margin: 0 0 1.3rem;
+    font-size: .92rem;
+    line-height: 1.65;
+  }
+  .ctx-conclude .lead { color: var(--accent); font-weight: 600; }
+  @media (max-width: 640px) { .ctx-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -36,6 +105,7 @@
   <p class="lesson-meta">
     <span class="chip">第 4 课</span>
     <span class="chip">知识储备篇 · §3 中断</span>
+    <span class="chip">覆盖 §3.1 分工 / §3.2 处理 / §3.3 软中断</span>
     <span class="chip">Linux 6.6 (你的环境)</span>
     <a href="../reference/glossary.html">术语表</a>
   </p>
@@ -172,6 +242,84 @@
       而且睡眠会让中断长期关着,整个系统的中断响应崩盘。这条规则没有例外,违反了就是 oops/死锁。
     </p>
     <p>这也解释了为什么 workqueue/threaded IRQ 这么重要:它们<strong>在进程上下文跑</strong>,把"中断触发的重活"搬进能睡眠的世界。</p>
+  </aside>
+
+  <h2 id="two-contexts">小心陷阱:"上下文"这个词有两层含义</h2>
+
+  <p>
+    很多人卡在这一步:<strong>"hardirq 和 softirq 栈相同、寄存器相同、特权级相同,凭什么是两个上下文?"</strong>
+    卡住的原因是——你脑子里的"上下文"和内核说的"上下文"是<strong>两个不同的东西</strong>,只是中文恰好都叫"上下文"。
+  </p>
+
+  <table>
+    <thead><tr><th> </th><th>硬件上下文 <small>(hardware context)</small></th><th>执行上下文 <small>(execution context)</small></th></tr></thead>
+    <tbody>
+      <tr><td><strong>是什么</strong></td><td>CPU 物理执行环境</td><td>内核的<strong>软件标记</strong></td></tr>
+      <tr><td><strong>组成</strong></td><td>寄存器 / 栈 / 特权级(ring 0/3) / 页表</td><td><code>preempt_count</code> 位域 + <code>current</code></td></tr>
+      <tr><td><strong>谁切换</strong></td><td>调度器(<code>context_switch</code>)</td><td>中断进入/退出代码</td></tr>
+      <tr><td><strong>切换成本</strong></td><td>高(存全套寄存器)</td><td>极低(改几个 bit)</td></tr>
+      <tr><td><strong>用来干嘛</strong></td><td><strong>进程切换</strong>时保存/恢复</td><td>判断"这段代码<strong>能睡眠吗、能持什么锁</strong>"</td></tr>
+    </tbody>
+  </table>
+
+  <aside class="callout">
+    <span class="callout-title">"能不能睡觉"——这才是内核区分上下文的唯一理由</span>
+    <p>
+      寄存器、栈、特权级都是<strong>中性的物理状态</strong>,本身没有"能不能睡眠"这种属性。内核需要知道"现在这段代码属于哪种执行域、受什么规则约束",
+      于是发明了<strong>执行上下文</strong>——一个软件层标签,记录在 <code>thread_info-&gt;preempt_count</code> 的不同 bit 上。
+    </p>
+    <p>判断"当前是什么上下文"靠的就是查这些 bit:</p>
+<pre><code>in_irq()     = (preempt_count &amp; HARDIRQ_MASK) != 0   <span class="com">// hardirq 位</span>
+in_softirq() = (preempt_count &amp; SOFTIRQ_MASK) != 0   <span class="com">// softirq 位</span>
+<span class="com">// 两者都为 0,且 current 指向真实进程 → 进程上下文</span></pre>
+    <p><strong>hardirq 和 softirq 之所以是两个上下文,靠的不是栈/寄存器,而是 <code>preempt_count</code> 上不同的 bit。</strong></p>
+  </aside>
+
+  <p><strong>一个具体问题:softirq 跑的时候,上下文到底是什么?</strong></p>
+  <p>softirq 有<strong>两种触发路径</strong>。注意对比右边——执行上下文相同,但硬件上下文不同。</p>
+
+  <div class="ctx-grid">
+    <div class="ctx-card primary">
+      <span class="ctx-tag">路径 A · 常见</span>
+      <p class="ctx-title">hardirq 退出时跑</p>
+      <div class="ctx-chain">进程 a.out
+  │ 硬中断
+  ▼
+handler()
+  │ irq_exit()
+  ▼
+__do_softirq()</div>
+      <p class="ctx-row">执行上下文 = <b>softirq</b> <span class="same">(SOFTIRQ 位 = 1)</span></p>
+      <p class="ctx-row">硬件上下文 = <span class="diff">被中断的 a.out 的</span></p>
+      <p class="ctx-row" style="color:var(--ink-mute);font-size:.72rem;margin-top:.3rem">current 还指向 a.out</p>
+    </div>
+
+    <div class="ctx-card">
+      <span class="ctx-tag">路径 B · 兜底</span>
+      <p class="ctx-title">ksoftirqd 内核线程里跑</p>
+      <div class="ctx-chain">ksoftirqd 线程
+  │ 被调度器选中
+  ▼
+__do_softirq()</div>
+      <p class="ctx-row">执行上下文 = <b>softirq</b> <span class="same">(SOFTIRQ 位 = 1)</span></p>
+      <p class="ctx-row">硬件上下文 = <span class="diff">ksoftirqd 自己的</span></p>
+      <p class="ctx-row" style="color:var(--ink-mute);font-size:.72rem;margin-top:.3rem">current = ksoftirqd</p>
+    </div>
+  </div>
+
+  <div class="ctx-conclude">
+    <span class="lead">结论:</span>同一种执行上下文(softirq),却有两种硬件上下文。
+    你用"硬件上下文"模型去理解"执行上下文",当然觉得矛盾——因为它们根本是两层不同的概念。
+  </div>
+
+  <aside class="callout warn">
+    <span class="callout-title">认知升级口诀</span>
+    <p>以后在内核里看到"上下文",先问自己:</p>
+    <ul>
+      <li>这里说的是<strong>硬件上下文</strong>吗?(进程切换语境 → 寄存器/栈/特权级)</li>
+      <li>还是<strong>执行上下文</strong>?(中断/睡眠语境 → <code>preempt_count</code> + <code>current</code>)</li>
+    </ul>
+    <p>这是内核术语的一个历史包袱,英文也容易混:<code>context_switch</code> 指前者,<code>in_interrupt()</code> 判断的是后者。<strong>不是你理解错了,是同一个词被用在了两层意思上。</strong></p>
   </aside>
 
 
@@ -351,7 +499,7 @@ MODULE_DESCRIPTION(<span class="str">"Lesson 4: workqueue self-rescheduling demo
 
   <p class="lesson-nav">
     <a href="0003-rbtree.html">← 第 3 课:红黑树</a>
-    <a href="#">第 5 课:时间子系统(待生成)→</a>
+    <a href="0005-time.html">第 5 课:时间子系统 →</a>
   </p>
 
   <hr>
