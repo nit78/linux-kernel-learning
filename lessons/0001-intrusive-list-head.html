@@ -38,8 +38,9 @@
 
   <p class="lesson-meta">
     <span class="chip">第 1 课</span>
-    <span class="chip">知识储备篇 · §2.1</span>
-    <span class="chip">对应 Linux 6.2</span>
+    <span class="chip">知识储备篇 · §2.1 关系型数据结构</span>
+    <span class="chip">覆盖 §2.1.1 一对一 / §2.1.2 一对多 / §2.1.3 多对多</span>
+    <span class="chip">Linux 6.6 (你的环境)</span>
     <a href="../reference/glossary.html">术语表</a>
   </p>
 
@@ -162,6 +163,150 @@
       <tr><td><code>list_for_each_entry(item, &amp;head, member)</code></td><td>遍历并自动用 <code>container_of</code> 取出宿主，<code>item</code> 直接就是 <code>bt_device *</code>。<strong>最常用。</strong></td></tr>
     </tbody>
   </table>
+
+
+  <h2 id="relationships">关系建模：一对一 / 一对多 / 多对多</h2>
+
+  <aside class="callout tip">
+    <span class="callout-title">这一节补的是框架，不是新机制</span>
+    本书的 §2.1 标题就叫"<strong>关系型数据结构</strong>"——它要回答的问题是：
+    <em>当两个东西之间存在一对一、一对多、或多对多的关系时，内核分别用什么数据结构来表达？</em>
+    前面讲的 <code>list_head</code> 是<strong>一对多</strong>的那个工具；这一节把它放进框架里，并补上你没见过的<strong>多对多</strong>。
+  </aside>
+
+  <p>内核里几乎所有结构体都在表达某种"关系"。先看一张总表：</p>
+
+  <table>
+    <thead><tr>
+      <th>关系</th><th>用什么表达</th><th>典型例子</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>一对一</strong></td>
+        <td>单个指针，或<strong>内嵌</strong>(一个结构体直接包含另一个)</td>
+        <td><code>task_struct</code> 内嵌 <code>mm_struct</code> 指针；结构体与其成员</td>
+      </tr>
+      <tr>
+        <td><strong>一对多</strong></td>
+        <td><code>list_head</code> / <code>hlist</code> / <code>rbtree</code></td>
+        <td>一个总线挂多个设备；一个进程的多个子进程</td>
+      </tr>
+      <tr>
+        <td><strong>多对多</strong></td>
+        <td>一个<strong>辅助结构体</strong>（内含多个 <code>list_head</code> + 指向两端的指针）</td>
+        <td>input 子系统的 <code>input_handle</code>；本书的教师↔学生例子</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3 id="one-to-one">一对一：指针 vs 内嵌</h3>
+
+  <p>两个结构体之间的一对一关系有两种写法，各有取舍：</p>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>指针方式</h4>
+      <pre style="margin:0;font-size:.8rem;"><code>struct A {
+    struct B *b;   /* 指向 */
+};</code></pre>
+      <p>灵活：B 可以独立存在、可换、可为 NULL。两个结构体编译上独立。</p>
+    </div>
+    <div class="col">
+      <h4>内嵌方式</h4>
+      <pre style="margin:0;font-size:.8rem;"><code>struct A {
+    struct B b;    /* 直接包含 */
+};</code></pre>
+      <p>关系体现清晰、内存连续、管理方便。但 B 不能独立存在、生命周期绑死 A。</p>
+    </div>
+  </div>
+
+  <p>选哪个看语义:如果两者<strong>必须共存亡</strong>(如"进程与其私有数据"),内嵌更自然;
+  如果一方<strong>可缺失/可替换</strong>(如"文件与其所属 inode"),用指针。</p>
+
+  <h3 id="one-to-many">一对多：你已经会了</h3>
+
+  <p>前面整节讲的 <code>list_head</code>,本质就是<strong>一对多</strong>的建模工具——一个 <code>head</code>,挂多个 <code>node</code>。
+  本书 §2.1.2 还指出:一对多也可以用<strong>单向链表</strong>(node 只含一个 next 指针,最省),
+  当需要双向遍历/增删改时才升级到 <code>list_head</code> / <code>hlist</code>(第 2 课)、
+  或 <code>rbtree</code>(第 3 课,需要按序查找时)。</p>
+
+  <aside class="callout">
+    <span class="callout-title">一句话回扣前三课</span>
+    <code>list_head</code>、<code>hlist</code>、<code>rbtree</code> 都是"一对多"的不同形态:
+    无序用 list,省内存的哈希桶用 hlist,有序要快速查找用 rbtree。<strong>选型看关系的需求</strong>。
+  </aside>
+
+  <h3 id="many-to-many">多对多：为什么不能直接嵌 list_head</h3>
+
+  <p>这是本节的<strong>关键反直觉点</strong>,也是你前面问题的核心。看这个直觉但<strong>错误</strong>的尝试:</p>
+
+  <pre><code><span class="com">// ❌ 错误尝试:想让一个 student 同时是多个 teacher 的学生</span>
+<span class="kw">struct</span> student {
+    <span class="kw">struct</span> list_head node;   <span class="com">// 只有一个 node!</span>
+};
+<span class="com">// 问题:这个 node 只能挂在【一条】链上。</span>
+<span class="com">// 把它挂到 teacher_A 的学生链,它就从 teacher_B 的链上掉下来了。</span></code></pre>
+
+  <p><strong>一个 <code>list_head</code> 节点只能属于一条链</strong>——这是侵入式链表的物理约束。
+  多对多需要一个对象能同时出现在多条链上,所以光靠把 <code>list_head</code> 嵌进 <code>student</code> 做不到。</p>
+
+  <p>本书 §2.1.3 给出的标准方案:引入一个<strong>辅助结构体 <code>connection</code></strong>,
+  它内含<strong>两个</strong> <code>list_head</code> 节点(分别挂到两端的链)和指向两端的指针:</p>
+
+  <pre><code><span class="com">// 教师与学生的多对多关系(本书 §2.1.3 例子)</span>
+<span class="kw">struct</span> teacher {
+    <span class="kw">struct</span> list_head head_of_student_list;   <span class="com">// 该老师的学生链头</span>
+    <span class="com">/* others */</span>
+};
+
+<span class="kw">struct</span> student {
+    <span class="kw">struct</span> list_head head_of_teacher_list;   <span class="com">// 该学生的老师链头</span>
+    <span class="com">/* others */</span>
+};
+
+<span class="com">/* 关键:独立的 connection,把一对"老师-学生"关系实体化 */</span>
+<span class="kw">struct</span> connection {
+    <span class="kw">struct</span> list_head s_node;   <span class="com">// 挂到某个 teacher 的学生链</span>
+    <span class="kw">struct</span> list_head t_node;   <span class="com">// 挂到某个 student 的老师链</span>
+    <span class="kw">struct</span> teacher  *teacher;  <span class="com">// 反向指回两端</span>
+    <span class="kw">struct</span> student  *student;
+};
+
+<span class="com">/* "老师 T_A 有学生 S_A" 这样一条关系 = new 一个 connection,</span>
+<span class="com">   s_node 挂到 T_A-&gt;head_of_student_list,t_node 挂到 S_A-&gt;head_of_teacher_list。</span>
+<span class="com">   一个 student 可以有多个 connection(每个对应一个老师),反之亦然 → 多对多达成。*/</span></code></pre>
+
+  <p>用图来理解(三条关系: T_A→{S_A, S_B}, T_B→{S_A}):</p>
+
+  <div class="memfig"><span class="dim">每条边 = 一个 connection 实例,同时挂在两端的链上</span>
+
+  T_A.head_of_student_list ──→ [conn₁.s] ──→ [conn₂.s] ──→ <span class="dim">NULL</span>
+                                 │              │
+                                 ↓              ↓
+                              S_A           S_B
+                                 ↑
+                                 │
+  T_B.head_of_student_list ──→ [conn₃.s] ──→ <span class="dim">NULL</span>
+                                 │
+                                 └── 同时 conn₁ 和 conn₃ 的 student 都指向 S_A
+                                     (S_A 既是 T_A 又是 T_B 的学生 = 多对多)
+
+  <span class="dim">conn 的 t_node 同理挂到 student 的老师链,这里省略。</span></div>
+
+  <aside class="callout warn">
+    <span class="callout-title">合并两个 node 的前提:关系必须是"相互的"</span>
+    <p>本书特别指出:把 <code>s_node</code> 和 <code>t_node</code> 合进同一个 <code>connection</code>,前提是关系<strong>相互</strong>——
+    "S_A 是 T_A 的学生" ⟺ "T_A 是 S_A 的老师"。老师↔学生满足,所以可合并。</p>
+    <p>但<strong>单向关系不能合并</strong>,书举的例子是"粉丝暗恋偶像":A 崇拜 B,B 不一定知道 A。
+    这时强行合并会浪费空间或造成逻辑混乱,得用两个独立结构体。<em>这个细节体现了内核数据结构设计对语义的精确把控。</em></p>
+  </aside>
+
+  <h3 id="real-input">真实用例预告:input 子系统</h3>
+
+  <p>本书 §2.3 会用 <code>input</code> 子系统演示这个模式。它的核心结构 <code>input_handle</code>
+  就是一个 <code>connection</code>——把一个 <code>input_dev</code>(设备)和一个 <code>input_handler</code>(处理者)关联起来,
+  一个设备可被多个 handler 处理、一个 handler 也可处理多个设备(<strong>多对多</strong>)。
+  本质与你刚学的 teacher/student 例子完全同构。等你读到综合应用篇的设备驱动模型时,会再次撞见它。</p>
 
 
   <h2 id="lab">动手实验：一个能跑的 <code>.ko</code></h2>
@@ -291,6 +436,15 @@ clean:
     <label class="quiz-opt"><input type="radio" name="q2" value="b">省去 container_of 调用</label>
     <label class="quiz-opt"><input type="radio" name="q2" value="c">数据类型与链表解耦</label>
     <label class="quiz-opt"><input type="radio" name="q2" value="d">禁止共享遍历代码</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="c" data-explain="一个 list_head 节点物理上只能属于一条链(它只有一对 next/prev)。多对多要求一个对象同时出现在多条链上,所以不能简单嵌一个 list_head。标准做法是引入独立的 connection 辅助结构体,内含【多个】list_head(分别挂到两端的链)+ 指向两端的指针——这正是书的 teacher/student 方案,也是 input 子系统 input_handle 的真实结构。'换用红黑树'不对:rbtree 同样一次只能挂一棵。">
+    <p class="quiz-q">要表达"学生 ↔ 老师"的多对多关系(一个学生多老师、一个老师多学生),下面哪种做法是对的？</p>
+    <label class="quiz-opt"><input type="radio" name="q3" value="a">在 student 里嵌一个 list_head 就够</label>
+    <label class="quiz-opt"><input type="radio" name="q3" value="b">换成红黑树即可</label>
+    <label class="quiz-opt"><input type="radio" name="q3" value="c">用独立 connection,内含多个 list_head + 双向指针</label>
+    <label class="quiz-opt"><input type="radio" name="q3" value="d">student 内嵌一个 list_head 数组</label>
     <button class="quiz-check" type="button">提交</button>
   </div>
 
