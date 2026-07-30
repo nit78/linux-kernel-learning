@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 5 课 · 时间子系统</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/quiz.js" defer></script>
+<script src="../assets/notes.js" defer></script>
+<style>
+  .layerfig {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1.3rem 0;
+    color: var(--ink);
+  }
+  .layerfig .dim { color: var(--ink-mute); }
+  .layerfig .hl  { color: var(--accent); font-weight: 600; }
+  .layerfig .ok  { color: var(--ok); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="lesson-meta">
+    <span class="chip">第 5 课</span>
+    <span class="chip">知识储备篇 · §4 Linux 的时间</span>
+    <span class="chip">覆盖 §4.1 数据结构 / §4.2 衡量 / §4.3 时钟中断 / §4.4 timer&amp;hrtimer</span>
+    <a href="../reference/glossary.html">术语表</a>
+  </p>
+
+  <h1>时间子系统：jiffies、HZ 与两套定时器</h1>
+
+  <p>
+    你在 MCU 上用 SysTick 做心跳、用硬件定时器做精确定时——
+    内核里这两件事对应的是 <code>jiffies</code> 和 <code>hrtimer</code>。这节课把这条迁移线打通。
+  </p>
+
+  <aside class="callout tip">
+    <span class="callout-title">本课的连接点</span>
+    <p>第 3 课你学的<strong>红黑树</strong>,这课会在 <code>hrtimer</code> 里见到它的真实用武之地——
+    高精度定时器用 rbtree 按到期时间排序所有定时器。学过的东西立刻落地。</p>
+  </aside>
+
+
+  <h2 id="two-layers">内核时间的两层抽象</h2>
+
+  <p>内核管理时间不是一层,是两层,各有来历:</p>
+
+  <div class="layerfig">                          内核时间子系统
+
+     ┌─────────────────────────────────┐    ┌─────────────────────────────────┐
+     │   <span class="hl">低精度：基于 tick (jiffies)</span>   │    │   <span class="ok">高精度：基于硬件时钟</span>             │
+     │                                 │    │                                 │
+     │   • 全局计数器 jiffies           │    │   • ktime_t（纳秒级）            │
+     │   • 每秒 HZ 次 tick 中断         │    │   • 独立于 jiffies               │
+     │   • timer_list（时间轮）         │    │   • hrtimer（红黑树）            │
+     │   • 粒度：1/HZ 秒（毫秒级）      │    │   • 粒度：纳秒/微秒级            │
+     └──────────────┬──────────────────┘    └──────────────┬──────────────────┘
+                    │                                       │
+                    └───────────────┬───────────────────────┘
+                                    │
+                          <span class="dim">历史上先有低精度（tickless 之前）,</span>
+                          <span class="dim">后来硬件能做高精度了,才加了 hrtimer 一层。</span>
+                          <span class="dim">两套并存,各管各的场景。</span></div>
+
+  <p>为什么有两套?这是<strong>历史 + 工程</strong>的结果:早期硬件只能产生固定频率的 tick(比如 100 次/秒),
+  所有定时都是 tick 的整数倍,够用但粗糙。后来 CPU 有了高精度定时器(TSC、HPET),内核才加了 <code>hrtimer</code>。
+  但老接口 <code>timer_list</code> 仍保留——大量超时场景(网络重传、协议定时)根本不需要纳秒精度,用 jiffies 更省。</p>
+
+
+  <h2 id="jiffies">jiffies、HZ 与那个到处都是的转换</h2>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>MCU / 裸机</h4>
+      <p>SysTick 每 1ms 触发一次中断,中断里 <code>tick_count++</code>。需要计时时就读 <code>tick_count</code>,差值就是毫秒数。</p>
+      <p>"1 秒" = <code>tick_count 增加 1000</code>。</p>
+    </div>
+    <div class="col">
+      <h4>Linux 内核</h4>
+      <p>每个 tick 中断里 <code>jiffies</code> 自增。"1 秒" = <code>jiffies 增加 HZ</code>。</p>
+      <p><strong>HZ 是编译期常量</strong>(<code>CONFIG_HZ</code>),x86_64 默认 1000(服务器发行版常 250)。</p>
+    </div>
+  </div>
+
+  <pre><code><span class="com">// include/linux/jiffies.h</span>
+<span class="kw">extern</span> <span class="type">unsigned</span> <span class="type">long</span> <span class="kw">volatile</span> <span class="kw">__jiffy_data</span> jiffies;      <span class="com">// 32 位,会回绕</span>
+<span class="kw">extern</span> <span class="type">u64</span> <span class="kw">jiffies_64</span>;                               <span class="com">// 64 位,实际计数器</span>
+<span class="com">// jiffies 是 jiffies_64 的低 32 位别名;64 位系统上两者等价</span>
+
+<span class="com">// 64 位上读 jiffies 安全;但跨长间隔(>50天,32位)要用 jiffies_64</span></code></pre>
+
+  <p><strong>这就是为什么你在驱动代码里到处看到 <code>msecs_to_jiffies()</code></strong> —— 内部计时统一用 jiffies,
+  所以"100 毫秒"必须先转成 jiffies 数才能比较:</p>
+
+  <pre><code><span class="com">// 驱动里要"等 100ms"或比较时间差,标准写法:</span>
+<span class="type">unsigned</span> <span class="type">long</span> timeout = jiffies + msecs_to_jiffies(<span class="str">100</span>);
+<span class="kw">if</span> (time_after(jiffies, timeout)) {
+    <span class="com">// 超时了</span>
+}
+<span class="com">// 注意:绝对不要写 jiffies + 100,要经过 msecs_to_jiffies</span></code></pre>
+
+  <aside class="callout">
+    <span class="callout-title">比较 jiffies 的坑:回绕</span>
+    <p>因为 jiffies 会回绕(32 位下约 50 天一圈),直接 <code>jiffies &gt; timeout</code> 会出错。
+    内核提供 <code>time_after(a, b)</code> / <code>time_before(a, b)</code> 用减法处理回绕,<strong>永远用它们,别用裸比较</strong>。</p>
+  </aside>
+
+
+  <h2 id="two-timers">两套定时器:timer_list vs hrtimer</h2>
+
+  <p>这是本课的核心选型表。两套定时器的本质差别:</p>
+
+  <table>
+    <thead><tr>
+      <th>对比项</th><th><code>timer_list</code>（时间轮）</th><th><code>hrtimer</code>（高精度）</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>精度</td><td>jiffies 粒度（1/HZ 秒，~1ms）</td><td><strong>纳秒级</strong>（ktime_t）</td></tr>
+      <tr><td>数据结构</td><td>哈希<strong>时间轮</strong>（多级级联）</td><td><strong>红黑树</strong>（第 3 课学的！）</td></tr>
+      <tr><td>是否依赖 tick</td><td>是</td><td><strong>否</strong>（独立于 HZ）</td></tr>
+      <tr><td>开销</td><td>低，但有级联延迟尖峰</td><td>稍高，但<strong>可预测</strong></td></tr>
+      <tr><td>典型用途</td><td>网络重传、协议超时、普通驱动超时</td><td>多媒体、实时、需要 µs 精度</td></tr>
+      <tr><td>回调上下文</td><td>软中断（不可睡眠）</td><td>硬中断上下文（不可睡眠）</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>hrtimer 用红黑树</strong>——把所有定时器按到期时间排序,最左节点(最快到期)是 O(1) 取出。
+  这正是第 3 课 rbtree 的真实用武之地:O(log n) 插入、O(1) 取最值,完美契合"管理一堆按时间排序的定时器"。</p>
+
+  <aside class="callout warn">
+    <span class="callout-title">两套都不能在回调里睡眠</span>
+    <p>无论 <code>timer_list</code> 还是 <code>hrtimer</code>,回调都跑在<strong>中断类上下文</strong>(软中断 / 硬中断),
+    <strong>都不能睡眠</strong>(对照第 4 课的上下文铁律)。需要睡眠的"延迟工作" → workqueue 或 threaded IRQ。</p>
+  </aside>
+
+
+  <h2 id="api">真实 API</h2>
+
+  <h3>低精度：timer_list（6.x 现代接口）</h3>
+
+  <pre><code><span class="com">// 老接口 setup_timer / data 字段在 6.x 已移除。现代用 timer_setup:</span>
+<span class="kw">struct</span> timer_list {
+    <span class="kw">struct</span> hlist_node entry;
+    <span class="type">unsigned</span> <span class="type">long</span>       expires;          <span class="com">// 到期 jiffies</span>
+    <span class="type">void</span>              (*function)(<span class="kw">struct</span> timer_list *);  <span class="com">// 注意签名:只收 timer*</span>
+    <span class="type">u32</span>               flags;
+};
+
+<span class="com">// 注册:把回调绑到 timer 上</span>
+timer_setup(&amp;dev-&gt;timer, my_callback, <span class="str">0</span>);
+
+<span class="com">// 启动 / 重启(到期 jiffies)</span>
+mod_timer(&amp;dev-&gt;timer, jiffies + msecs_to_jiffies(<span class="str">100</span>));
+
+<span class="com">// 取消(同步版,等回调跑完)</span>
+del_timer_sync(&amp;dev-&gt;timer);</code></pre>
+
+  <p><strong>私有数据怎么办?</strong>老 API 靠 <code>data</code> 字段,6.x 改成"嵌入 + 反查":</p>
+
+  <pre><code><span class="kw">struct</span> my_dev {
+    <span class="type">int</span>               x;
+    <span class="kw">struct</span> timer_list  timer;      <span class="com">// 嵌入</span>
+};
+
+<span class="kw">static</span> <span class="type">void</span> my_callback(<span class="kw">struct</span> timer_list *t)
+{
+    <span class="kw">struct</span> my_dev *dev = <span class="kw">from_timer</span>(dev, t, timer);  <span class="com">// 反查宿主(又是 container_of!)</span>
+    pr_info(<span class="str">"tick, x=%d\n"</span>, dev-&gt;x);
+}</code></pre>
+
+  <p>看到 <code>from_timer</code> 了吗?它就是第 1 课的 <code>container_of</code>。你已经第三次撞见这个手法了——
+  内核数据结构的统一美学。</p>
+
+  <aside class="callout">
+    <span class="callout-title">from_timer 和 container_of 到底啥关系?为啥不直接用?</span>
+    <p><code>from_timer</code> 就是 <code>container_of</code> 的<strong>薄包装宏</strong>,定义只有一行:</p>
+<pre><code><span class="com">// include/linux/timer.h</span>
+<span class="kw">#define</span> from_timer(var, callback_timer, timer_field) \
+    container_of(callback_timer, typeof(*var), timer_field)</code></pre>
+    <p>包这一层有三个好处(本质都是<strong>防呆</strong>):</p>
+    <table>
+      <thead><tr><th> </th><th>直接用 container_of</th><th>用 from_timer</th></tr></thead>
+      <tbody>
+        <tr><td><strong>参数</strong></td><td><code>(ptr, type, member)</code> 全手填</td><td><code>(var, ptr, field)</code> 自动绑定</td></tr>
+        <tr><td><strong>类型</strong></td><td>手写完整类型名</td><td><code>typeof(*var)</code> 自动推导</td></tr>
+        <tr><td><strong>出错时</strong></td><td>顺序/类型填错<strong>编译器不报</strong>,运行时崩</td><td>字段名和宿主类型绑定到变量名,难写错</td></tr>
+        <tr><td><strong>改名时</strong></td><td>手写类型要改多处</td><td>靠 typeof 推导,改一处即可</td></tr>
+      </tbody>
+    </table>
+    <p>对比两种写法:</p>
+<pre><code><span class="com">// 笨写法:三个参数全是手填字符串,容易错</span>
+<span class="kw">struct</span> my_dev *dev = container_of(t, <span class="kw">struct</span> my_dev, timer);
+
+<span class="com">// from_timer:类型靠 typeof(*dev) 推导,字段名绑定</span>
+<span class="kw">struct</span> my_dev *dev = from_timer(dev, t, timer);</code></pre>
+    <p><strong>那为什么 hrtimer/list_head/rb_node 没有这种宏?</strong>
+    因为内核只为<strong>高频场景</strong>定制专用宏。<code>timer_list</code> 用得太广(4.15 去 <code>data</code> 字段时配套加了 <code>from_timer</code> + <code>timer_setup</code>),
+    值得专门做防呆包装;而 <code>hrtimer</code>、<code>list_head</code>、<code>rb_node</code> 直接用 <code>container_of</code> 原语——
+    它们也有别名宏(<code>list_entry</code> / <code>rb_entry</code>),但本质都一样。<strong>直接用 container_of 完全没问题</strong>,只是少了防呆保护。</p>
+  </aside>
+
+  <h3>高精度：hrtimer</h3>
+
+  <pre><code><span class="kw">struct</span> hrtimer {
+    <span class="kw">struct</span> timerqueue_node  node;     <span class="com">// 内部建在 rbtree 之上</span>
+    ktime_t                 _softexpires;
+    <span class="type">enum</span> hrtimer_restart    (*function)(<span class="kw">struct</span> hrtimer *);
+    <span class="kw">struct</span> hrtimer_clock_base *base;
+    <span class="com">/* ... */</span>
+};
+
+<span class="com">// 初始化:选时钟(CLOCK_MONOTONIC)和模式(相对/绝对)</span>
+hrtimer_init(&amp;timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+timer.function = my_hrtimer_cb;
+
+<span class="com">// 启动:1ms 后到期(ktime_set(秒, 纳秒))</span>
+hrtimer_start(&amp;timer, ktime_set(<span class="str">0</span>, <span class="str">1000000</span>), HRTIMER_MODE_REL);
+
+<span class="com">// 回调:返回 RESTART 就 forward 后继续,NORESTART 就停</span>
+<span class="kw">static</span> <span class="type">enum</span> hrtimer_restart my_hrtimer_cb(<span class="kw">struct</span> hrtimer *t)
+{
+    <span class="com">/* 做事 */</span>
+    hrtimer_forward_now(t, ktime_set(<span class="str">0</span>, <span class="str">1000000</span>));   <span class="com">// 往前推 1ms</span>
+    <span class="kw">return</span> HRTIMER_RESTART;
+}</code></pre>
+
+  <p><strong>私有数据怎么办?</strong>和上面的 <code>timer_list</code> 一样——<code>hrtimer</code> 本身<strong>不带业务数据</strong>,
+  它也是个<strong>侵入式挂钩</strong>。你的数据结构把 <code>hrtimer</code> 当字段嵌进来,回调里用 <code>container_of</code> 反查宿主:</p>
+
+  <pre><code><span class="kw">struct</span> my_dev {
+    <span class="type">int</span>           x;
+    <span class="kw">struct</span> hrtimer  timer;      <span class="com">// 嵌入(和 timer_list 一模一样)</span>
+};
+
+<span class="kw">static</span> <span class="type">enum</span> hrtimer_restart my_hrtimer_cb(<span class="kw">struct</span> hrtimer *t)
+{
+    <span class="kw">struct</span> my_dev *dev = container_of(t, <span class="kw">struct</span> my_dev, timer);  <span class="com">// 反查宿主</span>
+    pr_info(<span class="str">"tick, x=%d\n"</span>, dev-&gt;x);
+    hrtimer_forward_now(t, ktime_set(<span class="str">0</span>, <span class="str">1000000</span>));
+    <span class="kw">return</span> HRTIMER_RESTART;
+}</code></pre>
+
+  <p>注意这里没用专门的宏(像 <code>timer_list</code> 的 <code>from_timer</code>),而是<strong>直接</strong>用 <code>container_of</code>——
+  这反而更直白地暴露了本质:<code>hrtimer</code> 就是第 1 课 <code>list_head</code> 那套"数据嵌入挂钩"手法的<strong>又一次复用</strong>。</p>
+
+  <aside class="callout tip">
+    <span class="callout-title">挂钩家族大集合:你已经全会了</span>
+    <p>把这几课学的串起来,内核里所有"挂钩 + 反查宿主"的结构全是同一招:</p>
+    <table>
+      <thead><tr><th>挂钩</th><th>建在</th><th>反查宏</th><th>第几课见过</th></tr></thead>
+      <tbody>
+        <tr><td><code>list_head</code></td><td>—</td><td><code>list_entry</code> / <code>container_of</code></td><td>第 1 课</td></tr>
+        <tr><td><code>hlist_node</code></td><td>—</td><td><code>container_of</code></td><td>第 2 课</td></tr>
+        <tr><td><code>rb_node</code></td><td>—</td><td><code>rb_entry</code></td><td>第 3 课</td></tr>
+        <tr><td><code>timer_list</code></td><td>时间轮</td><td><code>from_timer</code></td><td>第 5 课</td></tr>
+        <tr><td><code>hrtimer</code></td><td>rbtree</td><td><code>container_of</code></td><td>第 5 课(这里)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>数据嵌入挂钩,回调/遍历时 <code>container_of</code> 取回宿主</strong>——
+    记住这一句,内核里 <code>work_struct</code>、<code>sk_buff</code>、<code>page</code> 等成百上千个结构你都能一眼看穿。</p>
+  </aside>
+
+
+  <h2 id="lab">动手实验:hrtimer 周期任务(WSL2 可跑)</h2>
+
+  <p>
+    目标:用 <code>hrtimer</code> 做 1ms 周期任务,跑 50 次后自停。对比第 4 课的 workqueue 方案——
+    你会发现 hrtimer 精度高得多(workqueue 受 HZ 限制,hrtimer 不受)。
+  </p>
+
+  <pre><code><span class="com">// bt_hrtimer.c — 第 5 课实验:hrtimer 高精度周期任务</span>
+<span class="kw">#include</span> &lt;linux/module.h&gt;
+<span class="kw">#include</span> &lt;linux/kernel.h&gt;
+<span class="kw">#include</span> &lt;linux/hrtimer.h&gt;
+<span class="kw">#include</span> &lt;linux/ktime.h&gt;
+
+<span class="kw">static</span> <span class="kw">struct</span> hrtimer bt_hr;
+<span class="kw">static</span> <span class="type">unsigned</span> <span class="type">int</span>  bt_count;
+<span class="kw">static</span> ktime_t        bt_period;
+
+<span class="kw">static</span> <span class="type">enum</span> hrtimer_restart bt_hr_cb(<span class="kw">struct</span> hrtimer *t)
+{
+    bt_count++;
+    <span class="kw">if</span> (bt_count &lt;= <span class="str">5</span>)     <span class="com">// 只打印前 5 次,避免刷屏</span>
+        pr_info(<span class="str">"bt_hr: tick %u\n"</span>, bt_count);
+
+    <span class="kw">if</span> (bt_count &gt;= <span class="str">50</span>) {
+        pr_info(<span class="str">"bt_hr: 完成 50 次,停止\n"</span>);
+        <span class="kw">return</span> HRTIMER_NORESTART;
+    }
+    hrtimer_forward_now(t, bt_period);
+    <span class="kw">return</span> HRTIMER_RESTART;
+}
+
+<span class="kw">static</span> <span class="type">int</span> __init bt_hr_init(<span class="type">void</span>)
+{
+    bt_period = ktime_set(<span class="str">0</span>, <span class="str">1000000</span>);    <span class="com">// 1ms = 1,000,000 ns</span>
+    bt_count = <span class="str">0</span>;
+
+    hrtimer_init(&amp;bt_hr, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    bt_hr.function = bt_hr_cb;
+    hrtimer_start(&amp;bt_hr, bt_period, HRTIMER_MODE_REL);
+
+    pr_info(<span class="str">"bt_hr: 启动 1ms 周期 hrtimer\n"</span>);
+    <span class="kw">return</span> 0;
+}
+
+<span class="kw">static</span> <span class="type">void</span> __exit bt_hr_exit(<span class="type">void</span>)
+{
+    hrtimer_cancel(&amp;bt_hr);     <span class="com">// 同第 4 课:卸载前必须取消</span>
+    pr_info(<span class="str">"bt_hr: 卸载,共 tick %u 次\n"</span>, bt_count);
+}
+
+module_init(bt_hr_init);
+module_exit(bt_hr_exit);
+MODULE_LICENSE(<span class="str">"GPL"</span>);
+MODULE_DESCRIPTION(<span class="str">"Lesson 5: hrtimer periodic demo"</span>);</code></pre>
+
+  <ol class="steps">
+    <li><code>make</code> → <code>bt_hrtimer.ko</code></li>
+    <li><code>sudo insmod bt_hrtimer.ko</code></li>
+    <li><code>dmesg | tail</code> —— 应看到前 5 个 tick,然后 50 次时"停止"。整个 50ms 内完成</li>
+    <li>对比第 4 课 workqueue 的 1 秒间隔:这里 1ms,精度高三个数量级</li>
+    <li><code>sudo rmmod bt_hrtimer</code> —— 看"共 tick X 次",应≈50</li>
+  </ol>
+
+  <aside class="callout tip">
+    <span class="callout-title">观察重点</span>
+    <p>50 次 tick 在约 50ms 内完成——如果用第 4 课的 workqueue 做不到这个精度(它受 HZ 限制,最小约 1ms 还有调度抖动)。
+    hrtimer 直接靠硬件时钟驱动,这就是"高精度"的可观察证据。</p>
+    <p>注意 <code>hrtimer_cancel</code> 与第 4 课 <code>cancel_delayed_work_sync</code> 是<strong>同一种模式</strong>:
+    卸载前必须取消未决的异步工作。这个"取消模式"你会在每个驱动里反复写。</p>
+  </aside>
+
+
+  <h2 id="delay-sleep">delay 家族:何时忙等,何时睡眠</h2>
+
+  <p>这是你写驱动时<strong>每天都要做的选择</strong>。"等一会儿"在内核里有两种实现,选错会浪费 CPU 或踩上下文坑:</p>
+
+  <table>
+    <thead><tr><th>函数</th><th>类型</th><th>可用上下文</th><th>何时用</th></tr></thead>
+    <tbody>
+      <tr><td><code>udelay(n)</code></td><td><strong>忙等</strong>(CPU 空转)</td><td>原子/中断 OK</td><td>很短(&lt;10µs),需精确</td></tr>
+      <tr><td><code>mdelay(n)</code></td><td>忙等(包装 udelay)</td><td>原子/中断 OK</td><td><strong>不推荐</strong>,能改 msleep 就改</td></tr>
+      <tr><td><code>usleep_range(min, max)</code></td><td><strong>睡眠</strong>(让出 CPU)</td><td>仅进程上下文</td><td><strong>10µs–20ms 首选</strong></td></tr>
+      <tr><td><code>msleep(n)</code></td><td>睡眠(让出 CPU)</td><td>仅进程上下文</td><td>&gt;20ms;短延时易超调</td></tr>
+    </tbody>
+  </table>
+
+  <aside class="callout warn">
+    <span class="callout-title">经典选型口诀</span>
+    <p><strong>在中断/原子上下文</strong>:只能 <code>udelay</code>(忙等,因为不能睡)。</p>
+    <p><strong>在进程上下文</strong>:10µs–20ms 用 <code>usleep_range</code>(比 msleep 精确),&gt;20ms 用 <code>msleep</code>。
+    别用 <code>mdelay</code> 白白占着 CPU。</p>
+    <p>这条规则跟第 4 课的"能不能睡眠看上下文"是<strong>同一条铁律</strong>的应用。</p>
+  </aside>
+
+
+  <h2 id="check">检验理解</h2>
+
+  <div class="quiz" data-correct="b" data-explain="hrtimer 用 ktime_t(纳秒),独立于 jiffies/HZ,定时器存于红黑树按到期时间排序——正是第 3 课 rbtree 的真实用武之地(O(log n) 插入、O(1) 取最左最快到期)。timer_list 才是基于 jiffies 的哈希时间轮,粒度 1/HZ。两者回调都在中断类上下文,都不能睡眠。">
+    <p class="quiz-q">关于 hrtimer 与 timer_list 的区别,哪个说法是对的?</p>
+    <label class="quiz-opt"><input type="radio" name="q1" value="a">hrtimer 基于 jiffies,timer_list 基于红黑树</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="b">hrtimer 纳秒精度独立于 jiffies,用红黑树排序</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="c">两者回调都在进程上下文,都能睡眠</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="d">timer_list 比 hrtimer 精度更高</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="c" data-explain="硬中断上下文绝对不能睡眠(第 4 课铁律),所以只能用忙等的 udelay。usleep_range/msleep 都会睡眠,仅进程上下文可用。mdelay 虽也是忙等可用,但内核文档明确不推荐(白白占 CPU)。">
+    <p class="quiz-q">你在一个硬中断 ISR 里需要等 5 微秒让硬件稳定,该用哪个?</p>
+    <label class="quiz-opt"><input type="radio" name="q2" value="a">usleep_range(5, 10)</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="b">msleep(1)</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="c">udelay(5)</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="d">mdelay(5)</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+
+  <h2 id="chapter-end">知识储备篇 · 小结</h2>
+
+  <p>五课下来,你搭起了读内核源码的全部地基:</p>
+
+  <table>
+    <thead><tr><th>课</th><th>主题</th><th>核心收获</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>list_head</td><td>侵入式链表、container_of</td></tr>
+      <tr><td>2</td><td>hlist</td><td>双指针统一删除、哈希桶</td></tr>
+      <tr><td>3</td><td>rbtree</td><td>有序结构、内核"半成品"设计哲学</td></tr>
+      <tr><td>4</td><td>中断</td><td>上下文铁律、上半部/下半部分工、workqueue</td></tr>
+      <tr><td>5</td><td>时间</td><td>jiffies/HZ、两套定时器、delay/sleep 选型</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    这些不是孤立的点——它们在内核里互相印证:<code>hrtimer</code> 用 rbtree、<code>timer_list</code> 回调用
+    <code>from_timer</code>(container_of)、workqueue 与 hrtimer 都要"卸载前取消"。
+    你已经能读懂内核里相当一部分基础设施代码了。
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">下一站:内核设计模式(§2.2)</span>
+    <p>第 6 课讲贯穿全书、后续每一篇都会撞见的两个模式:<strong>模板方法</strong>(<code>file_operations</code> 函数指针表)
+    和<strong>观察者</strong>(通知链 notifier chain)。学完它们,你读驱动代码时那些"一坨函数指针"和
+    <code>xxx_notify</code> 就都有了名字。</p>
+    <p>设计模式之后,知识储备篇还差最后一块——<strong>附录 B 内核同步</strong>(spinlock/mutex/RCU)。
+    同步补齐后,才正式进入<strong>内存管理篇</strong>(§5–9,驱动开发的头号痛点)。</p>
+  </aside>
+
+  <aside class="callout">
+    <span class="callout-title">推荐精读</span>
+    <ul style="margin-bottom:0">
+      <li>官方文档:<a href="https://docs.kernel.org/timers/hrtimers.html" target="_blank" rel="noopener">hrtimers 子系统</a>、<a href="https://docs.kernel.org/timers/delay_sleep_functions.html" target="_blank" rel="noopener">Delay and sleep mechanisms</a>(delay 选型权威依据)</li>
+      <li>LWN:<a href="https://lwn.net/Articles/167897/" target="_blank" rel="noopener">The high-resolution timer API</a>(hrtimer 来历与设计)、<a href="https://lwn.net/Articles/735887/" target="_blank" rel="noopener">Improving the kernel timers API</a>(timer_setup 现代化的原因)</li>
+      <li>本书 §4「Linux 的时间」,图解时钟中断与 timer/hrtimer</li>
+    </ul>
+  </aside>
+
+  <h3>带着这些问题进入下一课(设计模式)</h3>
+  <ul>
+    <li><strong>你在用户态调 mmap 时,内核里是怎么"派发"到具体文件系统的?是不是某种函数指针表?</strong>——引出 file_operations。</li>
+    <li><strong>驱动里常见的 <code>xxx_notify</code> / <code>register_xxx_notifier</code> 是什么机制?</strong>——引出通知链/观察者。</li>
+    <li><strong>设计模式不是面向对象语言的概念吗?内核用 C 写,怎么实现?</strong></li>
+  </ul>
+
+  <p class="lesson-nav">
+    <a href="0004-interrupts.html">← 第 4 课:中断</a>
+    <a href="0006-design-patterns.html">第 6 课:内核设计模式 →</a>
+  </p>
+
+  <hr>
+  <p style="font-family:var(--sans);font-size:.85rem;color:var(--ink-mute);">
+    实验跑通后告诉我:hrtimer 的 50 次是不是约 50ms 完成?精度跟你预期一致吗?
+    delay 家族(中断里只能 udelay、进程上下文用 usleep_range)清晰吗?
+    准备好就说"继续"——下一课讲<strong>设计模式</strong>(file_operations + 通知链),之后补内核同步,再进内存管理篇。
+  </p>
+
+</div>
+</body>
+</html>

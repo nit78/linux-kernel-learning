@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 6 课 · 内核设计模式：模板方法与观察者</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/quiz.js" defer></script>
+<script src="../assets/notes.js" defer></script>
+<style>
+  .patternfig {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1.3rem 0;
+    color: var(--ink);
+  }
+  .patternfig .dim { color: var(--ink-mute); }
+  .patternfig .hl  { color: var(--accent); font-weight: 600; }
+  .patternfig .ok  { color: var(--ok); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="lesson-meta">
+    <span class="chip">第 6 课</span>
+    <span class="chip">知识储备篇 · §2.2 设计模式</span>
+    <span class="chip">覆盖 §2.2.1 模板方法 / §2.2.2 观察者</span>
+    <span class="chip">Linux 6.6 (你的环境)</span>
+    <a href="../reference/glossary.html">术语表</a>
+  </p>
+
+  <h1>内核设计模式：模板方法与观察者</h1>
+
+  <p>
+    内核是 C 写的,但到处是"<strong>设计模式</strong>"。这课讲贯穿全书、你在后续每一篇都会撞见的两个:
+    <strong>模板方法</strong>(VFS 的 <code>file_operations</code>)和<strong>观察者</strong>(通知链)。
+    学完它们,你读驱动代码时那些"一坨函数指针"和"<code>xxx_notify</code>"就都有了名字。
+  </p>
+
+  <aside class="callout tip">
+    <span class="callout-title">这课的连接点</span>
+    模板方法的核心载体是 <code>struct file_operations</code>——一个<strong>函数指针表</strong>。
+    而"函数指针表 + 嵌入式结构体"正是第 1 课侵入式数据结构的延伸:数据结构里嵌入"行为"。
+    两个模式都会用到你已经熟悉的 <code>container_of</code>。
+  </aside>
+
+
+  <h2 id="template">§2.2.1 模板方法设计模式</h2>
+
+  <p><strong>一句话</strong>:有一个固定的<strong>流程骨架</strong>(模板),具体步骤的<strong>实现</strong>交给使用者填。
+  内核管流程,使用者管细节。</p>
+
+  <p>本书 §2.2.1 用"做菜"做比喻:三步固定流程(备菜→加工→盛出)是模板,刀&锅 vs 蒸笼只决定每步怎么做。
+  内核里的真实落地是 <strong>VFS + <code>file_operations</code></strong>:</p>
+
+  <div class="patternfig">用户调用 mmap() 时的模板方法
+
+  <span class="hl">【模板骨架 = VFS 通用流程】</span>         <span class="ok">【具体步骤 = 驱动/文件系统填】</span>
+
+  sys_mmap (内核)                    file_operations {
+      ├─ 检查参数、准备 VMA              .mmap      = ext4_mmap,     ← 各家自己实现
+      ├─ 调用 file-&gt;f_op-&gt;mmap()  ────→  .read      = ...,
+      │   (模板在这里"调用使用者填的步骤")  .write     = ...,
+      ├─ 安装映射到进程地址空间            .fault     = ...,           ← 缺页时才分配物理页
+      └─ 返回                              .release   = ...,
+                                         }
+
+  <span class="dim">VFS 决定"mmap 这件事分几步、按什么顺序";</span>
+  <span class="dim">ext4 / 你的驱动只决定"其中某一步具体怎么做"。</span></div>
+
+  <p>真实定义就是一个<strong>全函数指针的结构体</strong>:</p>
+
+  <pre><code><span class="com">// include/linux/fs.h (简化)</span>
+<span class="kw">struct</span> <span class="type">file_operations</span> {
+    <span class="type">int</span>    (*open)   (<span class="kw">struct</span> inode *, <span class="kw">struct</span> file *);
+    ssize_t (*read)   (<span class="kw">struct</span> file *, <span class="type">char</span> __user *, size_t, loff_t *);
+    ssize_t (*write)  (<span class="kw">struct</span> file *, <span class="kw">const</span> <span class="type">char</span> __user *, size_t, loff_t *);
+    <span class="type">int</span>    (*mmap)   (<span class="kw">struct</span> file *, <span class="kw">struct</span> vm_area_struct *);
+    <span class="type">int</span>    (*release)(<span class="kw">struct</span> inode *, <span class="kw">struct</span> file *);
+    <span class="com">/* 几十个函数指针 … */</span>
+};
+
+<span class="com">// 一个真实的"填表":ext4 把自己的实现填进模板</span>
+<span class="kw">static</span> <span class="kw">const</span> <span class="kw">struct</span> file_operations ext4_file_operations = {
+    .read_iter = ext4_file_read_iter,
+    .write_iter= ext4_file_write_iter,
+    .mmap      = ext4_file_mmap,
+    .open      = ext4_file_open,
+    .release   = ext4_release_file,
+    <span class="com">/* … */</span>
+};</code></pre>
+
+  <aside class="callout">
+    <span class="callout-title">本质:函数指针表 = C 版的"接口/虚函数"</span>
+    <p>面向对象语言里这叫"接口 + 多态":VFS 定义接口(<code>file_operations</code>),
+    各文件系统提供实现(ext4 / sysfs / proc 各填一份)。<strong>用 C 也能写出面向对象</strong>——
+    函数指针表 + 结构体就是 C 的虚函数表。读内核时遇到"<code>xxx_op</code> / <code>xxx_ops</code>"
+    命名的结构体,十有八九就是模板方法。</p>
+  </aside>
+
+  <h3 id="fault-lazy">进阶:mmap 不分配物理页,fault 才分配</h3>
+
+  <p>模板方法在 mmap 这里有个精彩细节,也是<strong>本书 §17 + §8 缺页异常</strong>的伏笔:</p>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>直觉但不对</h4>
+      <p>mmap 调用时,立刻把物理内存分配好、映射进页表。</p>
+      <p>问题:映射 1GB 只读 1KB,却分配 1GB 物理页——巨大浪费。</p>
+    </div>
+    <div class="col">
+      <h4>内核实际做法(懒分配)</h4>
+      <p>mmap 只<strong>登记</strong>一段虚拟地址区间(VMA),<strong>不分配物理页</strong>。</p>
+      <p>进程真去访问时 → 触发<strong>缺页异常</strong> → 内核调用 <code>vm_ops-&gt;fault()</code>
+      → 此时才分配那一页物理内存。</p>
+    </div>
+  </div>
+
+  <p>所以 mmap 这个"模板"分两段:<code>f_op-&gt;mmap</code>(登记 VMA) +
+  <code>vm_ops-&gt;fault</code>(缺页时填页)。后者也是一个函数指针表:</p>
+
+  <pre><code><span class="com">// include/linux/mm.h (简化) — VMA 的操作表,另一组"模板"</span>
+<span class="kw">struct</span> <span class="type">vm_operations_struct</span> {
+    <span class="type">int</span> (*open)(<span class="kw">struct</span> vm_area_struct *);
+    vm_fault_t (*fault)(<span class="kw">struct</span> vm_fault *);   <span class="com">// ← 缺页时被调</span>
+    <span class="type">void</span> (*close)(<span class="kw">struct</span> vm_area_struct *);
+};</code></pre>
+
+  <aside class="callout warn">
+    <span class="callout-title">版本纠偏:mmap file 操作正在退场(6.x)</span>
+    <p>老资料都说"驱动填 <code>f_op-&gt;mmap</code>"。<strong>6.x 起,这个回调正在被废弃</strong>:
+    LWN 2024 文章 <a href="https://lwn.net/Articles/1038715/" target="_blank" rel="noopener">The phaseout of the mmap() file operation</a>
+    说明 VFS 改用新的 <code>mmap_prepare</code> 回调 + 基于 fault 的模型。
+    驱动应迁到新接口。读老驱动仍会见到旧 <code>mmap</code>,要能看懂;
+    写新驱动要看 <a href="https://docs.kernel.org/filesystems/mmap_prepare.html" target="_blank" rel="noopener">官方 mmap_prepare 文档</a>。</p>
+    <p><strong>但模式没变</strong>——还是"VFS 管流程,驱动填某一步"。变的只是填哪个槽。</p>
+  </aside>
+
+
+  <h2 id="observer">§2.2.2 观察者设计模式</h2>
+
+  <p><strong>一句话</strong>:被观察者维护一个订阅者列表,有事时统一通知列表上的每个人;观察者不用轮询。
+  解耦"事件源"和"关心事件的人"。</p>
+
+  <p>本书 §2.2.2 用"订报纸"比喻:报社(被观察者)维护订阅列表,新报印好按列表派送;读者(观察者)不必天天跑去问。
+  内核里的落地是<strong>通知链(notifier chain)</strong>。看到 <code>xxx_notify</code> 多半是被观察者,
+  <code>xxx_listener</code> / <code>register_xxx_notifier</code> 多半是观察者。</p>
+
+  <h3>核心数据结构:订阅链 + 回调</h3>
+
+  <pre><code><span class="com">// include/linux/notifier.h (简化)</span>
+<span class="kw">struct</span> <span class="type">notifier_block</span> {
+    notifier_fn_t notifier_call;   <span class="com">// 观察者的回调函数</span>
+    <span class="kw">struct</span> notifier_block *next; <span class="com">// 串成链(又见 list!)— 单链即可</span>
+    <span class="type">int</span> priority;                 <span class="com">// 优先级,高的先收到</span>
+};
+
+<span class="com">// 回调签名:val 是事件类型,v 是事件数据</span>
+<span class="kw">typedef</span> <span class="type">int</span> (*notifier_fn_t)(<span class="kw">struct</span> notifier_block *nb,
+                            <span class="type">unsigned</span> <span class="type">long</span> val, <span class="type">void</span> *v);</code></pre>
+
+  <p>四种变体,差别在<strong>用什么锁、能在什么上下文调用</strong>(又见第 4 课的上下文铁律):</p>
+
+  <table>
+    <thead><tr><th>变体</th><th>头类型</th><th>锁</th><th>回调上下文</th><th>能睡眠?</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Blocking</strong></td><td><code>blocking_notifier_head</code></td><td>rwsem</td><td>进程</td><td>✅ 能</td></tr>
+      <tr><td><strong>Atomic</strong></td><td><code>atomic_notifier_head</code></td><td>spinlock</td><td>中断/原子</td><td>❌ 不能</td></tr>
+      <tr><td><strong>SRCU</strong></td><td><code>srcu_notifier_head</code></td><td>SRCU</td><td>进程</td><td>✅ 能</td></tr>
+      <tr><td><strong>Raw</strong></td><td><code>raw_notifier_head</code></td><td>无(调用者自管)</td><td>任意</td><td>取决于调用者</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>选哪个?</strong> 看事件源在什么上下文发通知、回调要不要睡眠。
+  最常用 Blocking(进程上下文、可睡眠)。本书 §2.2.2 提到的观察者模式,绝大多数用 blocking notifier 实现。</p>
+
+  <div class="patternfig">通知链的两端
+
+  <span class="hl">【被观察者(发布者)】</span>                    <span class="ok">【观察者(订阅者)】</span>
+
+  static BLOCKING_NOTIFIER_HEAD(evt_list);     static int my_cb(struct notifier_block *nb,
+                                                    unsigned long val, void *v) {
+  // 有事时:                                       pr_info("事件 %lu\n", val);
+  blocking_notifier_call_chain(&evt_list,           return NOTIFY_OK;
+                               EVT_FOO, data);  }
+                                               static struct notifier_block my_nb = {
+  // 内核遍历链,逐个调 notifier_call              .notifier_call = my_cb,
+                                               };
+                                               <span class="com">// 订阅:</span>
+                                               blocking_notifier_chain_register(&evt_list, &amp;my_nb);</div>
+
+  <p>回调的返回值控制链的遍历:</p>
+  <table>
+    <thead><tr><th>返回值</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>NOTIFY_OK</code></td><td>处理了,继续通知下一个。</td></tr>
+      <tr><td><code>NOTIFY_DONE</code></td><td>不关心,继续。</td></tr>
+      <tr><td><code>NOTIFY_STOP</code></td><td>停止通知后续。</td></tr>
+      <tr><td><code>NOTIFY_BAD</code></td><td>出错,停止。</td></tr>
+    </tbody>
+  </table>
+
+
+  <h2 id="lab">动手实验:module 通知链(WSL2 可跑)</h2>
+
+  <p>
+    这个实验特别精彩——它是<strong>自观察</strong>的:你的模块注册成观察者,
+    监听"别的模块被加载/卸载"这个事件。加载实验模块后,你<em>再</em> 加载第 1 课的 <code>bt_list.ko</code>,
+    就能从 <code>dmesg</code> 看到"模块加载"事件被你的观察者捕获。模板方法和观察者都用 <code>container_of</code>
+    串结构体——你会再次见到第 1 课的手法。
+  </p>
+
+  <pre><code><span class="com">// bt_observer.c — 第 6 课实验:观察 module 加载/卸载事件</span>
+<span class="kw">#include</span> &lt;linux/module.h&gt;
+<span class="kw">#include</span> &lt;linux/kernel.h&gt;
+<span class="kw">#include</span> &lt;linux/notifier.h&gt;
+
+<span class="com">/* 观察者回调:有模块状态变化时被调用 */</span>
+<span class="kw">static</span> <span class="type">int</span> bt_module_event(<span class="kw">struct</span> notifier_block *nb,
+                          <span class="type">unsigned</span> <span class="type">long</span> action, <span class="type">void</span> *data)
+{
+    <span class="kw">struct</span> module *mod = data;
+
+    <span class="kw">switch</span> (action) {
+    <span class="kw">case</span> MODULE_STATE_LIVE:    <span class="com">// 完全加载成功</span>
+        pr_info(<span class="str">"bt_obs: 模块加载完成 [%s]\n"</span>, mod-&gt;name);
+        <span class="kw">break</span>;
+    <span class="kw">case</span> MODULE_STATE_GOING:   <span class="com">// 正在卸载</span>
+        pr_info(<span class="str">"bt_obs: 模块正在卸载 [%s]\n"</span>, mod-&gt;name);
+        <span class="kw">break</span>;
+    <span class="kw">default</span>:
+        <span class="kw">break</span>;   <span class="com">// MODULE_STATE_COMING 等,这里不打印</span>
+    }
+    <span class="kw">return</span> NOTIFY_OK;
+}
+
+<span class="com">/* 订阅块:把回调填进 notifier_block(模板方法!) */</span>
+<span class="kw">static</span> <span class="kw">struct</span> notifier_block bt_nb = {
+    .notifier_call = bt_module_event,
+    .priority       = <span class="str">0</span>,
+};
+
+<span class="kw">static</span> <span class="type">int</span> __init bt_obs_init(<span class="type">void</span>)
+{
+    <span class="type">int</span> ret = register_module_notifier(&amp;bt_nb);
+    pr_info(<span class="str">"bt_obs: 已注册模块通知链观察者 (ret=%d)\n"</span>, ret);
+    <span class="kw">return</span> ret;
+}
+
+<span class="kw">static</span> <span class="type">void</span> __exit bt_obs_exit(<span class="type">void</span>)
+{
+    unregister_module_notifier(&amp;bt_nb);
+    pr_info(<span class="str">"bt_obs: 已注销\n"</span>);
+}
+
+module_init(bt_obs_init);
+module_exit(bt_obs_exit);
+MODULE_LICENSE(<span class="str">"GPL"</span>);
+MODULE_DESCRIPTION(<span class="str">"Lesson 6: observer pattern via module notifier"</span>);</code></pre>
+
+  <p><strong>跑起来 + 触发事件</strong>(Makefile 同前,<code>obj-m := bt_observer.o</code>):</p>
+  <ol class="steps">
+    <li><code>make</code> → <code>bt_observer.ko</code></li>
+    <li><code>sudo insmod bt_observer.ko</code> —— 观察者上线</li>
+    <li><code>sudo insmod bt_list.ko</code> —— <strong>关键</strong>:加载第 1 课那个模块,触发"模块加载"事件</li>
+    <li><code>dmesg | tail</code> —— 应看到 <code>bt_obs: 模块加载完成 [bt_list]</code>。你的观察者捕获到了别人被加载!</li>
+    <li><code>sudo rmmod bt_list</code> —— 应看到 <code>bt_obs: 模块正在卸载 [bt_list]</code></li>
+    <li><code>sudo rmmod bt_observer</code> —— 观察者下线</li>
+  </ol>
+
+  <aside class="callout tip">
+    <span class="callout-title">两个模式一次看到</span>
+    <p>这个实验同时演示了两个模式:</p>
+    <ul style="margin-bottom:0">
+      <li><strong>观察者</strong>:你的模块订阅事件,内核(<code>kernel/module.c</code>)在别人加载/卸载时调用你的回调。你<strong>没轮询</strong>——是被动收到通知。</li>
+      <li><strong>模板方法</strong>:你把 <code>bt_module_event</code> 填进 <code>notifier_block.notifier_call</code>(函数指针表),内核的 <code>notifier_call_chain</code> 负责"遍历链、逐个调用"——流程归它,你的实现填进槽里。</li>
+    </ul>
+  </aside>
+
+
+  <h2 id="check">检验理解</h2>
+
+  <div class="quiz" data-correct="c" data-explain="file_operations 是一组函数指针,内核(VFS)的 sys_mmap 等定义了流程骨架,具体每一步(mmap/fault/read…)由各文件系统/驱动填进对应函数指针。这正是'模板方法':流程归框架,细节填空。'数据结构而非行为'错(它就是行为表);'观察者模式'是另一回事(notifier chain);'动态加载'无关。">
+    <p class="quiz-q">file_operations 在 VFS 里扮演的角色,最准确的描述是?</p>
+    <label class="quiz-opt"><input type="radio" name="q1" value="a">一种数据结构,与行为无关</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="b">观察者模式的实现</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="c">模板方法的"填空表"</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="d">模块动态加载机制</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="b" data-explain="观察者模式的核心收益是解耦:发布者只维护一个订阅者列表、统一通知,不关心具体是谁;观察者被动接收、无需轮询。内核落地是 notifier chain(xxx_notify 是发布、register_xxx_notifier 是订阅)。blocking vs atomic 的区别在锁与能否睡眠,那是实现细节;回调'立即执行'是机制描述而非收益。">
+    <p class="quiz-q">内核的通知链(notifier chain)实现了观察者模式,它最核心的收益是?</p>
+    <label class="quiz-opt"><input type="radio" name="q2" value="a">让回调运行得更快</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="b">解耦事件源与关心它的人,免去轮询</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="c">保证回调一定立即执行</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="d">让所有回调共享同一把锁</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+
+  <h2 id="next">接下来</h2>
+
+  <p>
+    这两个模式你会在后续每一篇反复撞见:<code>file_operations</code>(文件系统篇)、
+    <code>vm_operations_struct</code>(内存篇的缺页)、<code>net_device_ops</code>(网络)、
+    <code>device_driver</code> 的 probe/remove(综合应用篇的驱动模型)——全是模板方法。
+    而 CPU 热插拔、网络设备注册、reboot、panic 通知——全是观察者。<strong>有了名字,代码就不再是一坨函数指针。</strong>
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">推荐精读</span>
+    <ul style="margin-bottom:0">
+      <li>本书 §2.2「内核中常见的设计模式」(这课的主线,图解做菜/订报比喻)</li>
+      <li>LWN 必读:<a href="https://lwn.net/Articles/1038715/" target="_blank" rel="noopener">The phaseout of the mmap() file operation</a>(mmap 模式的 6.x 演进)</li>
+      <li>LWN 经典:<a href="https://lwn.net/Articles/160501/" target="_blank" rel="noopener">Kernel development (notifiers)</a>(通知链全景)</li>
+      <li>官方:<a href="https://docs.kernel.org/filesystems/mmap_prepare.html" target="_blank" rel="noopener">mmap_prepare HOWTO</a>(新模板接口)</li>
+    </ul>
+  </aside>
+
+  <h3>带着这些问题进入下一课(内核同步)</h3>
+  <ul>
+    <li><strong>实验里你加载/卸载 <code>bt_list.ko</code> 时,观察者回调一定能"看到"完整的 <code>module</code> 结构吗?会不会有竞争?</strong>——引出附录 B 同步。</li>
+    <li><strong><code>file_operations</code> 那张函数指针表,如果两个线程同时调 <code>read</code>,驱动要怎么保护自己的状态?</strong>——引出自旋锁/mutex。</li>
+    <li><strong>atomic notifier 为什么不能睡眠?和第 4 课的"硬中断不能睡"是什么关系?</strong></li>
+  </ul>
+
+  <p class="lesson-nav">
+    <a href="0005-time.html">← 第 5 课:时间子系统</a>
+    <a href="#">第 7 课:内核同步(待生成)→</a>
+  </p>
+
+  <hr>
+  <p style="font-family:var(--sans);font-size:.85rem;color:var(--ink-mute);">
+    实验跑通后告诉我:加载 <code>bt_list.ko</code> 时,观察者捕获到事件了吗?dmesg 输出符合预期吗?
+    两个 quiz 都答对后,我们就进<strong>第 7 课内核同步</strong>(附录 B,13 个子节,三大核心篇的必备前置)——
+    那一课信息量大,但学完你就能读懂绝大多数驱动里的锁用法。
+  </p>
+
+</div>
+</body>
+</html>

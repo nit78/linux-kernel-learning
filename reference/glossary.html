@@ -55,7 +55,7 @@
   <h1>术语表（Glossary）</h1>
   <p class="lesson-meta">
     <span class="chip">随课程扩充</span>
-    <span class="chip">已收录 24 条</span>
+    <span class="chip">已收录 36 条</span>
     <a href="../lessons/0001-intrusive-list-head.html">← 回到第 1 课</a>
   </p>
   <p class="glossary-intro">
@@ -294,6 +294,98 @@
       handler（上半部）只屏蔽中断 + 唤醒一个内核线程并返回 <code>IRQ_WAKE_THREAD</code>；
       thread_fn（下半部）跑在<strong>进程上下文</strong>，可睡眠、可做 I/O（如 I²C/SPI 读寄存器）。
       现代驱动首选，尤其当中断处理需要睡眠时。<code>request_irq</code> 自 ~4.5 起只是 thread_fn=NULL 的 <code>request_threaded_irq</code>。
+    </dd>
+  </dl>
+
+  <p class="group-label">时间与定时器（第 5 课）</p>
+
+  <dl class="gloss">
+    <dt>jiffies <span class="en">jiffies</span></dt>
+    <dd>
+      内核全局变量，记录<strong>自启动以来的 tick 数</strong>。每个 tick 中断里自增。是低精度时间的统一度量。
+      <code>jiffies</code> 实际是 <code>jiffies_64</code>（64 位计数器）的低 32 位别名；64 位系统上二者等价，32 位上约 50 天回绕。
+      <span class="avoid">避免用裸 <code>&gt;</code> 比较 jiffies——会因回绕出错，必须用 <code>time_after</code>/<code>time_before</code>。</span>
+    </dd>
+
+    <dt>HZ <span class="en">HZ</span></dt>
+    <dd>
+      编译期常量（<code>CONFIG_HZ</code>），表示<strong>每秒的 tick 中断次数</strong>。1 jiffy = 1/HZ 秒。
+      x86_64 upstream defconfig 默认 1000（服务器发行版常 250）。HZ 越高响应越好但开销越大。
+      驱动里"100ms"必须经 <code>msecs_to_jiffies(100)</code> 转成 jiffies 数才能用。
+    </dd>
+
+    <dt>timer_list（时间轮） <span class="en">timer wheel / low-resolution timer</span></dt>
+    <dd>
+      内核的低精度定时器，基于 jiffies，粒度 1/HZ 秒。内部用<strong>哈希时间轮</strong>（多级级联）组织。
+      6.x 起 API：<code>timer_setup(t, cb, flags)</code>，回调签名是 <code>void cb(struct timer_list *)</code>
+      （老 <code>setup_timer</code> + <code>data</code> 字段已移除），私有数据用 <code>from_timer()</code>（即 container_of）反查。
+      适合网络重传、协议超时等粗粒度场景。
+    </dd>
+
+    <dt>hrtimer（高精度定时器） <span class="en">high-resolution timer</span></dt>
+    <dd>
+      内核的高精度定时器，基于 <code>ktime_t</code>（纳秒），<strong>独立于 jiffies/HZ</strong>。
+      定时器存在<strong>红黑树</strong>里按到期时间排序（O(log n) 插入，O(1) 取最左最快到期）——
+      正是 rbtree 的真实用武之地。
+      API：<code>hrtimer_init</code> / <code>hrtimer_start</code> / <code>hrtimer_forward_now</code>，
+      回调返回 <code>HRTIMER_RESTART</code> 重排或 <code>HRTIMER_NORESTART</code> 停止。
+      用于多媒体、实时等需要 µs 精度的场景。
+    </dd>
+
+    <dt>ktime_t <span class="en">ktime_t</span></dt>
+    <dd>
+      hrtimer 用的纳秒级时间类型。<code>ktime_set(秒, 纳秒)</code> 构造，例如 <code>ktime_set(0, 1000000)</code> = 1ms。
+      与 jiffies（tick 数）不同，它是绝对时间量。
+    </dd>
+
+    <dt>delay 家族 <span class="en">udelay / mdelay / usleep_range / msleep</span></dt>
+    <dd>
+      "等一会儿"在内核里有忙等与睡眠两种：
+      <code>udelay(n)</code>（忙等 µs，原子上下文可用）、<code>mdelay</code>（忙等 ms，不推荐）；
+      <code>usleep_range(min, max)</code>（睡眠，10µs–20ms 首选）、<code>msleep(n)</code>（睡眠，&gt;20ms）。
+      后两者仅进程上下文可用（会睡眠）。选型口诀跟第 4 课"能不能睡眠看上下文"是同一条铁律。
+    </dd>
+  </dl>
+
+  <p class="group-label">设计模式（第 6 课）</p>
+
+  <dl class="gloss">
+    <dt>模板方法设计模式 <span class="en">Template Method pattern</span></dt>
+    <dd>
+      定义一个流程的<strong>骨架</strong>（模板），把某几个步骤的具体实现延迟到使用者填。
+      内核里典型落地：<strong>函数指针表</strong>（如 <code>file_operations</code>、<code>vm_operations_struct</code>、
+      <code>net_device_ops</code>）。VFS/通用框架管"流程怎么走"，各驱动/文件系统把实现填进对应函数指针槽——
+      这就是 C 版的"接口 + 多态"。读内核遇到 <code>xxx_op</code>/<code>xxx_ops</code> 命名的结构体，多半是模板方法。
+    </dd>
+
+    <dt>观察者设计模式 <span class="en">Observer pattern</span></dt>
+    <dd>
+      被观察者维护一个订阅者列表，有事时统一通知；观察者被动接收、无需轮询。解耦"事件源"和"关心它的人"。
+      内核落地是<strong>通知链</strong>（notifier chain）。<code>xxx_notify</code> 多半是被观察者，
+      <code>register_xxx_notifier</code>/<code>xxx_listener</code> 多半是观察者。
+    </dd>
+
+    <dt>file_operations <span class="en">struct file_operations</span></dt>
+    <dd>
+      VFS 提供的"文件操作模板"——一个全是函数指针的结构体（open/read/write/mmap/release/fault…几十个槽）。
+      各文件系统/驱动实例化一份，填入自己的实现。是模板方法模式在内核里最高频的载体。
+      <span class="ref">6.x 演进：经典的 <code>mmap</code> 回调正在被 <code>mmap_prepare</code> + 基于 fault 的模型取代（见 LWN 1038715）。</span>
+    </dd>
+
+    <dt>vm_operations_struct <span class="en">struct vm_operations_struct</span></dt>
+    <dd>
+      VMA（虚拟内存区域）的操作表，另一组模板。关键是 <code>fault</code> 回调：mmap 只登记 VMA，
+      进程真正访问时触发缺页异常，内核调 <code>vm_ops-&gt;fault()</code> 才分配物理页（懒分配）。
+      是第 8 章缺页异常的接口入口。
+    </dd>
+
+    <dt>notifier chain / 通知链 <span class="en">notifier chain</span></dt>
+    <dd>
+      内核的观察者模式原语。由 <code>notifier_block</code> 串成的单链，每节点含一个回调。
+      四种变体：<strong>blocking</strong>（rwsem，进程上下文，可睡眠）、<strong>atomic</strong>（spinlock，中断上下文，不可睡）、
+      SRCU、raw（无锁）。API：<code>BLOCKING_NOTIFIER_HEAD</code>、<code>blocking_notifier_chain_register</code>、
+      <code>blocking_notifier_call_chain</code>。典型链：module、netdev、reboot、cpu、panic。
+      回调返回 <code>NOTIFY_OK</code>/<code>NOTIFY_DONE</code>/<code>NOTIFY_STOP</code>/<code>NOTIFY_BAD</code> 控制遍历。
     </dd>
   </dl>
 
