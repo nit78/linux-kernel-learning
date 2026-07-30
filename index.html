@@ -149,10 +149,10 @@
     </p>
 
     <div class="progress-row">
-      <span class="chip done">已完成 4 课</span>
-      <span class="chip">当前: 知识储备篇</span>
-      <span class="chip">下一课: 时间与定时器</span>
-      <div class="progress-bar"><span style="width:17%"></span></div>
+      <span class="chip done">已完成 6 课</span>
+      <span class="chip">当前: 内存管理篇</span>
+      <span class="chip">下一课: 物理内存模型</span>
+      <div class="progress-bar"><span style="width:26%"></span></div>
     </div>
   </header>
 
@@ -161,7 +161,7 @@
     <div class="part-head">
       <h2>第一篇 · 知识储备</h2>
       <span class="part-range">§1–4</span>
-      <span class="part-status active">进行中</span>
+      <span class="part-status done">已完成</span>
     </div>
     <p style="color:var(--ink-soft);margin-top:0;font-size:.95rem;">
       数据结构 / 中断 / 时间——打通 MCU → 内核的思维转换。本篇是后续每一章的地基。
@@ -200,10 +200,21 @@
         </span>
         <span class="badge done">已完成</span>
       </li>
-      <li class="todo">
+      <li>
         <span class="num">0005</span>
-        <span class="title">时间与定时器:jiffies / hrtimer<span class="topic">§4 · 周期 vs 高精度</span></span>
-        <span class="badge next">下一课</span>
+        <span class="title">
+          <a href="lessons/0005-time.html">时间子系统:jiffies、HZ 与两套定时器</a>
+          <span class="topic">§4 · timer_list 时间轮 vs hrtimer 红黑树</span>
+        </span>
+        <span class="badge done">已完成</span>
+      </li>
+      <li>
+        <span class="num">0006</span>
+        <span class="title">
+          <a href="lessons/0006-design-patterns.html">内核设计模式:模板方法与观察者</a>
+          <span class="topic">§2.2 · file_operations · notifier chain</span>
+        </span>
+        <span class="badge done">已完成</span>
       </li>
     </ul>
   </section>
@@ -213,29 +224,29 @@
     <div class="part-head">
       <h2>第二篇 · 内存管理</h2>
       <span class="part-range">§5–9</span>
-      <span class="part-status">待开始</span>
+      <span class="part-status active">进行中</span>
     </div>
     <p style="color:var(--ink-soft);margin-top:0;font-size:.95rem;">
       驱动开发的头号痛点,对本课程价值最高。从页→zone→buddy→slab,到 kmalloc 家族与 page fault。
     </p>
     <ul class="lessons">
       <li class="todo">
-        <span class="num">0006</span>
+        <span class="num">0007</span>
         <span class="title">物理内存模型:页、zone、NUMA<span class="topic">§5</span></span>
-        <span class="badge">待学</span>
+        <span class="badge next">下一课</span>
       </li>
       <li class="todo">
-        <span class="num">0007</span>
+        <span class="num">0008</span>
         <span class="title">伙伴系统 Buddy Allocator<span class="topic">§6</span></span>
         <span class="badge">待学</span>
       </li>
       <li class="todo">
-        <span class="num">0008</span>
+        <span class="num">0009</span>
         <span class="title">Slab/Slub:kmalloc 的来源<span class="topic">§7 · 驱动高频</span></span>
         <span class="badge">待学</span>
       </li>
       <li class="todo">
-        <span class="num">0009</span>
+        <span class="num">0010</span>
         <span class="title">虚拟地址与 page fault<span class="topic">§8–9</span></span>
         <span class="badge">待学</span>
       </li>
