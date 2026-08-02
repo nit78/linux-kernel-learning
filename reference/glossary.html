@@ -55,7 +55,7 @@
   <h1>术语表（Glossary）</h1>
   <p class="lesson-meta">
     <span class="chip">随课程扩充</span>
-    <span class="chip">已收录 36 条</span>
+    <span class="chip">已收录 50 条</span>
     <a href="../lessons/0001-intrusive-list-head.html">← 回到第 1 课</a>
   </p>
   <p class="glossary-intro">
@@ -386,6 +386,100 @@
       SRCU、raw（无锁）。API：<code>BLOCKING_NOTIFIER_HEAD</code>、<code>blocking_notifier_chain_register</code>、
       <code>blocking_notifier_call_chain</code>。典型链：module、netdev、reboot、cpu、panic。
       回调返回 <code>NOTIFY_OK</code>/<code>NOTIFY_DONE</code>/<code>NOTIFY_STOP</code>/<code>NOTIFY_BAD</code> 控制遍历。
+    </dd>
+  </dl>
+
+  <p class="group-label">内核同步（第 7–8 课）</p>
+
+  <dl class="gloss">
+    <dt>竞争 <span class="en">race condition</span></dt>
+    <dd>
+      多个执行流（CPU 核、中断、线程）<strong>同时</strong>访问<strong>同一份</strong>共享数据，至少一个是写，且未加同步保护 → 结果不确定。
+      内核竞争来源三维度叠加：多 CPU 核 + 中断 + 抢占。
+    </dd>
+
+    <dt>临界区 <span class="en">critical section</span></dt>
+    <dd>
+      访问共享数据的代码段，必须用同步原语（锁、原子操作等）保护，使其对其他执行流看起来是<strong>原子不可分割</strong>的。
+    </dd>
+
+    <dt>每 CPU 变量 <span class="en">per-CPU variable</span></dt>
+    <dd>
+      免锁手段：每个 CPU 核持有一份独立副本，写自己的不会竞争。API：<code>DEFINE_PER_CPU</code>、
+      <code>this_cpu_inc</code>、<code>per_cpu(var, cpu)</code>。适合高频计数/统计。要总数时跨核汇总才需考虑同步。
+    </dd>
+
+    <dt>atomic_t <span class="en">atomic variable</span></dt>
+    <dd>
+      单变量的原子读-改-写原语，跨核免锁。API：<code>atomic_inc</code>、<code>atomic_add</code>、
+      <code>atomic_read</code>、<code>atomic_inc_return</code>。比 percpu 重（跨核），但比锁轻。
+    </dd>
+
+    <dt>READ_ONCE / WRITE_ONCE <span class="en">READ_ONCE / WRITE_ONCE</span></dt>
+    <dd>
+      对单变量并发读写（只需读/写本身不被编译器拆碎，不要求读-改-写原子）的现代推荐原语。防编译器<strong>撕裂/融合/消除</strong>，
+      相当于 C11 的 <code>memory_order_relaxed</code>。<strong>内核明确不推荐</strong>裸 <code>volatile</code>，用这两个代替。
+    </dd>
+
+    <dt>内存屏障 <span class="en">memory barrier</span></dt>
+    <dd>
+      强制 CPU/编译器按指定顺序执行内存访问的指令。<code>smp_mb()</code>（全屏障）、<code>smp_rmb()</code>（读）、<code>smp_wmb()</code>（写）。
+      因为编译器和 CPU 都会乱序读写以求性能，需要严格顺序时插屏障。日常多用 READ_ONCE/WRITE_ONCE 即可。
+    </dd>
+
+    <dt>自旋锁 <span class="en">spinlock</span></dt>
+    <dd>
+      抢不到就<strong>忙等</strong>（CPU 空转循环重试），<strong>绝不睡眠</strong>。适用短临界区、中断上下文可用。
+      四变体：<code>spin_lock</code>（锁绝不沾中断）、<code>spin_lock_bh</code>（关软中断）、
+      <code>spin_lock_irq</code>（关中断）、<code>spin_lock_irqsave</code>（关中断+存状态，<strong>最通用安全</strong>）。
+      <span class="avoid">持锁期间绝不能睡眠，否则死锁。</span>
+    </dd>
+
+    <dt>互斥锁 <span class="en">mutex</span></dt>
+    <dd>
+      抢不到就<strong>睡眠让出 CPU</strong>，被唤醒后再来。适用长临界区、<strong>仅进程上下文</strong>（会睡）。
+      API：<code>DEFINE_MUTEX</code>、<code>mutex_lock</code>、<code>mutex_unlock</code>。
+      <span class="avoid">中断上下文绝不能用——会睡眠导致死锁。</span>
+    </dd>
+
+    <dt>信号量 <span class="en">semaphore</span></dt>
+    <dd>
+      可作"计数信号量"（允许 N 个执行流同时进）或互斥（初值 1，此时类似 mutex）。API：<code>sema_init</code>、<code>down</code>、<code>up</code>。
+      会睡眠，仅进程上下文。mutex 是更严格的互斥（多了调试/类型检查），新代码优先 mutex。
+    </dd>
+
+    <dt>读写锁 <span class="en">rwlock</span></dt>
+    <dd>
+      读多写少场景：多个读者可并发持有读锁，写者独占。比普通锁让读者不互斥。但写仍需等所有读完成。
+    </dd>
+
+    <dt>顺序锁 <span class="en">seqlock</span></dt>
+    <dd>
+      读多写少、且读者不要阻塞写的场景：读者<strong>不加锁</strong>，只在读前后读序号，中途序号变就重读；
+      写者独占、写时序号++。典型用于时间戳、统计。比 rwlock 更让写者畅通。
+    </dd>
+
+    <dt>禁抢占 <span class="en">preempt_disable</span></dt>
+    <dd>
+      <code>preempt_disable()</code> 阻止当前任务被抢占（不被打断切走），直到 <code>preempt_enable()</code>。
+      轻量同步手段，比锁便宜。<strong>禁抢占等价于原子上下文，期间不能睡眠</strong>（又见第 4 课铁律）。
+      RCU 读侧免锁的根基：非抢占内核里 <code>rcu_read_lock</code> ≈ <code>preempt_disable</code> + 编译器屏障。
+    </dd>
+
+    <dt>RCU <span class="en">Read-Copy-Update</span></dt>
+    <dd>
+      内核最精巧的同步机制，专为"读极多写极少"优化。<strong>读者完全不加锁、零开销</strong>（非抢占内核下
+      <code>rcu_read_lock</code> 连原子指令都没有）；写者复制一份、原子换指针、<strong>等一个宽限期</strong>再回收旧版。
+      哲学：不让读者付费，让<strong>写者付费</strong>。撑起路由表、进程链表、文件系统元数据等核心结构。
+      API：<code>rcu_read_lock</code>/<code>rcu_read_unlock</code>（读侧）、<code>rcu_dereference</code>（安全取指针）、
+      <code>rcu_assign_pointer</code>（发布）、<code>synchronize_rcu</code>/<code>call_rcu</code>/<code>kfree_rcu</code>（写侧等宽限期+回收）。
+    </dd>
+
+    <dt>宽限期 <span class="en">grace period</span></dt>
+    <dd>
+      RCU 的核心概念：所有 CPU 都至少经过一次<strong>静止状态</strong>（quiescent state，如上下文切换、idle、用户态返回）的时间窗。
+      经过静止状态意味着该核退出了之前开始的任何 RCU 读临界区。<code>synchronize_rcu()</code> 阻塞等一个宽限期，
+      返回后即可安全释放旧数据（所有持旧指针的读者都已退出）。代价是写者延迟（毫秒级），故 RCU 不适合频繁写。
     </dd>
   </dl>
 
