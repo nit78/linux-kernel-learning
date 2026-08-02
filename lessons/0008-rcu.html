@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 8 课 · RCU 与读侧免锁</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/quiz.js" defer></script>
+<script src="../assets/notes.js" defer></script>
+<style>
+  .rcufig {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1.3rem 0;
+    color: var(--ink);
+  }
+  .rcufig .dim { color: var(--ink-mute); }
+  .rcufig .hl  { color: var(--accent); font-weight: 600; }
+  .rcufig .ok  { color: var(--ok); font-weight: 600; }
+  .rcufig .err { color: var(--err); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="lesson-meta">
+    <span class="chip">第 8 课</span>
+    <span class="chip">附录 B · 内核同步(下)</span>
+    <span class="chip">覆盖 §B.2.12 RCU / §B.2.3 屏障 / §B.2.6 禁抢占</span>
+    <span class="chip">知识储备篇 · 终章</span>
+    <span class="chip">Linux 6.6 (你的环境)</span>
+    <a href="../reference/glossary.html">术语表</a>
+  </p>
+
+  <h1>RCU:让读者零开销的同步魔法</h1>
+
+  <p>
+    这是知识储备篇的<strong>真正终章</strong>——讲完这课,你就集齐了读内核驱动和三大核心篇所需的全部基础。
+    RCU(Read-Copy-Update)是内核<strong>最精巧</strong>的同步机制:读者<strong>完全不加锁、零开销</strong>,
+    写者复制一份改、择机回收旧的。它撑起了路由表、进程链表、文件系统元数据等"读极多写极少"的核心数据结构。
+  </p>
+
+  <aside class="callout tip">
+    <span class="callout-title">这课的三个组件一起讲</span>
+    <p>RCU 主线(§B.2.12),外加你上一课留的两个 🟡/⬜ 点:</p>
+    <ul style="margin-bottom:0">
+      <li><strong>§B.2.6 禁抢占</strong>:因为 RCU 读侧免锁的根基就是 <code>preempt_disable</code>——两者天然咬合。</li>
+      <li><strong>§B.2.3 内存屏障</strong>:因为 <code>rcu_dereference</code> 的精髓就是"恰好够用的内存顺序"——这正好把屏障讲透。</li>
+    </ul>
+  </aside>
+
+
+  <h2 id="idea">RCU 的核心思想:让写者付费,不让读者付费</h2>
+
+  <p>第 7 课的所有锁(rwlock/seqlock/spinlock),读者都要付出某种代价(原子指令、缓存行抖动、重试)。RCU 反转这个思路:</p>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>传统锁(第 7 课)</h4>
+      <p>读者和写者互相付费:读者加锁(原子操作、缓存同步),写者也加锁。读多时,读者之间的同步开销就大。</p>
+    </div>
+    <div class="col">
+      <h4>RCU</h4>
+      <p><strong>读者几乎不付费</strong>(无锁、无原子指令);<strong>写者付费</strong>——复制一份新数据、改、原子换指针,然后<strong>等一个宽限期</strong>再回收旧数据。</p>
+    </div>
+  </div>
+
+  <p>为什么能这样?因为<strong>读旧版本是安全的</strong>——只要旧数据还没被释放,持有旧指针的读者照样能正常读完。写者要做的是<strong>延迟回收</strong>,确保所有"正读着旧版本"的读者都退出了,再 <code>kfree</code>。</p>
+
+  <div class="rcufig">RCU 更新一次的时间轴(读侧零锁)
+
+  时间 ──────────────────────────────────────────────→
+
+  <span class="hl">读者 A</span>: rcu_read_lock(); p = rcu_dereference(gptr); 用 p... rcu_read_unlock();
+                                                          ↓ 写者在这期间换指针也没事,A 持的是旧 p,旧 p 还活着
+  <span class="ok">写者</span> : new = kmalloc(...); *new = 改后的值;
+            rcu_assign_pointer(gptr, new);   <span class="dim">// 原子换指针,新读者拿到 new</span>
+            synchronize_rcu();                <span class="dim">// 等宽限期——等所有"持旧 p"的读者退出</span>
+            <span class="dim">/* 宽限期过后,确信读者 A 那种已经 unlock */</span>
+            kfree(old);                       <span class="dim">// 现在才能安全释放旧版本</span>
+
+  <span class="hl">读者 B</span>(换指针后进入): rcu_read_lock(); p = rcu_dereference(gptr); <span class="ok">// 拿到 new</span>
+
+  <span class="dim">关键:读者 A 在宽限期结束前不可能还在用 old,所以 kfree(old) 安全。</span></div>
+
+
+  <h2 id="reader-side">读侧三件套 + §B.2.6 禁抢占</h2>
+
+  <pre><code><span class="com">// 读侧:标记临界区 + 安全取指针</span>
+rcu_read_lock();                              <span class="com">// 进入 RCU 读临界区</span>
+p = rcu_dereference(gptr);                    <span class="com">// 安全读取受 RCU 保护的指针</span>
+<span class="com">/* 用 p 访问数据,但不能睡眠(非可抢占 RCU 下) */</span>
+rcu_read_unlock();                            <span class="com">// 退出</span></code></pre>
+
+  <p><strong>为什么读侧不加锁就安全?</strong>这就是 §B.2.6 <strong>禁抢占</strong>登场的时刻——RCU 读侧免锁的根基:</p>
+
+  <table>
+    <thead><tr><th>内核配置</th><th><code>rcu_read_lock()</code> 实际做什么</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>非抢占(<code>PREEMPT_NONE</code>/<code>VOLUNTARY</code>)<br><small>WSL2 默认这类</small></td>
+        <td>≈ <code>preempt_disable()</code> + 编译器屏障。<strong>无原子指令、无缓存抖动</strong>。读者在这个核上不会被切走,所以"这个核一定在临界区内"可以由"它没经过静止状态"推断。</td>
+      </tr>
+      <tr>
+        <td>抢占(<code>PREEMPT</code>/<code>PREEMPT_RT</code>)</td>
+        <td>增加当前任务的嵌套计数(<code>current-&gt;rcu_read_lock_nesting++</code>),RCU 通过采样计数器判断宽限期。读侧仍无锁,但可被抢占。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <aside class="callout">
+    <span class="callout-title">§B.2.6 禁抢占(preempt_disable)的本质</span>
+    <p><code>preempt_disable()</code> 阻止当前任务被抢占(不会被打断切走),直到 <code>preempt_enable()</code>。
+    它本身是个轻量同步手段——比锁便宜得多。RCU 借用它来"画"读临界区:读者持 preempt_disable 期间不会被切走,
+    所以一旦这个核发生上下文切换(静止状态),就证明它<strong>已经退出了</strong>所有 RCU 读临界区。这是宽限期判定的基础。</p>
+    <p><strong>约束</strong>:非抢占 RCU 读临界区里<strong>不能睡眠</strong>(又见第 4 课铁律——禁抢占等价于原子上下文)。</p>
+  </aside>
+
+
+  <h2 id="writer-side">写侧三件套 + §B.2.3 内存屏障</h2>
+
+  <pre><code><span class="com">// 写侧:复制 → 改 → 原子换指针 → 等宽限期 → 释放旧版</span>
+<span class="kw">struct</span> foo *new = kmalloc(<span class="kw">sizeof</span>(*new), GFP_KERNEL);
+*new = 改后的值;                          <span class="com">// 1. 复制并改</span>
+rcu_assign_pointer(gptr, new);            <span class="com">// 2. 发布:原子换指针(含写屏障)</span>
+
+<span class="com">// 方式 A:同步等(简单,但写者阻塞)</span>
+synchronize_rcu();                        <span class="com">// 3. 等一个宽限期</span>
+kfree(old);                               <span class="com">// 4. 安全释放</span>
+
+<span class="com">// 方式 B:异步回调(不阻塞,适合不能睡的热路径)</span>
+call_rcu(old, foo_rcu_free);              <span class="com">// 宽限期后自动调 foo_rcu_free(old)</span>
+<span class="com">// 或一步到位:</span>
+kfree_rcu(old, rcu_head_in_foo);          <span class="com">// 等价于 call_rcu + kfree</span></code></pre>
+
+  <p><strong>为什么 <code>rcu_assign_pointer</code> 和 <code>rcu_dereference</code> 要成对出现?</strong>这就是 §B.2.3 <strong>内存屏障</strong>登场的时刻——</p>
+
+  <div class="rcufig">数据发布/订阅的内存顺序问题
+
+  写者:                          读者:
+  new-&gt;data = 42;                p = gptr;            <span class="err">// 可能先看到新指针</span>
+  rcu_assign_pointer(gptr, new);  print(p-&gt;data);      <span class="err">// 但 p-&gt;data 还是旧值/未初始化!</span>
+
+  <span class="dim">CPU 和编译器都可能乱序:new-&gt;data=42 可能在 gptr=new 之后才对其他核可见。</span>
+  <span class="dim">读者看到了新指针,却读到新数据还没写入的字段——错。</span>
+
+  <span class="ok">rcu_assign_pointer</span> 在换指针前插<strong>写屏障</strong>(保证 data 先于指针可见);
+  <span class="ok">rcu_dereference</span> 在取指针后插<strong>读屏障/依赖屏障</strong>(保证先取指针、再取其指向的数据)。
+  两者配合 = 发布-订阅顺序正确。</div>
+
+  <aside class="callout">
+    <span class="callout-title">§B.2.3 内存屏障的本质(收尾)</span>
+    <p>编译器和 CPU 都会<strong>乱序</strong>内存访问以追求性能。需要严格顺序时插屏障:</p>
+    <ul style="margin-bottom:0">
+      <li><code>smp_wmb()</code>:本核之前的写,先于之后的写对其他核可见(写屏障)。<code>rcu_assign_pointer</code> 内含它。</li>
+      <li><code>smp_rmb()</code>:本核之前的读,先于之后的读(读屏障)。<code>rcu_dereference</code> 在 DEC Alpha 上含它,其他架构靠地址依赖顺序。</li>
+      <li><code>smp_mb()</code>:读写都屏障(最重)。</li>
+    </ul>
+    <p><strong>给读 RCU 代码的你</strong>:看到 <code>rcu_assign_pointer</code> / <code>rcu_dereference</code> 成对出现,就知道作者已经处理好了发布-订阅顺序——你不用再操心屏障。这也是为什么 RCU 提供这两个宏而不让你裸读写指针。</p>
+  </aside>
+
+
+  <h2 id="grace-period">宽限期(grace period):写者的等待</h2>
+
+  <p><strong>宽限期</strong> = 所有 CPU 都至少经过一次<strong>静止状态</strong>(quiescent state,如上下文切换、进入 idle、用户态返回)的时间窗。
+  经过静止状态意味着该核退出了任何之前开始的 RCU 读临界区。</p>
+
+  <div class="rcufig">宽限期的判定
+
+  写者调 synchronize_rcu()  ──────→  宽限期开始
+      CPU0: ──[读者 A 在临界区]──(上下文切换)──   <span class="dim">← 静止状态,A 必已 unlock</span>
+      CPU1: ──[读者 B 在临界区]──(上下文切换)──   <span class="dim">← 静止状态</span>
+      CPU2: ──(idle)──                          <span class="dim">← idle 也是静止状态</span>
+                                     ──────→  宽限期结束,synchronize_rcu() 返回
+  <span class="dim">此刻,所有"换指针前就在读"的读者都不可能还在用 old → kfree(old) 安全。</span></div>
+
+  <p><strong>代价</strong>:写者要等宽限期(典型毫秒级),所以 RCU <strong>不适合频繁写</strong>的场景,只适合"读极多、写极少"。</p>
+
+
+  <h2 id="vs-seqlock">RCU vs seqlock:都是读多写少,区别?</h2>
+
+  <table>
+    <thead><tr><th>对比</th><th>seqlock(第 7 课)</th><th>RCU</th></tr></thead>
+    <tbody>
+      <tr><td>读者开销</td><td>无锁,但读失败要<strong>重试</strong></td><td>无锁、无重试,<strong>读到的一定是某个一致的快照</strong></td></tr>
+      <tr><td>读者阻塞写?</td><td><strong>不阻塞</strong></td><td><strong>不阻塞</strong></td></tr>
+      <tr><td>写者开销</td><td>加写锁、序号++</td><td>复制一份 + 换指针 + 等宽限期 + 释放旧版</td></tr>
+      <tr><td>典型用途</td><td>简单值(时间戳、统计)</td><td><strong>指针/复杂数据结构</strong>(链表、树、路由表)</td></tr>
+      <tr><td>读者看到什么</td><td>可能读到中间值,重读</td><td>稳定的旧版本或新版本,不需重读</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>选型</strong>:简单数值用 seqlock(读者轻,重试无妨);复杂结构/指针用 RCU(读者要稳定遍历、不能重试)。</p>
+
+
+  <h2 id="lab">动手实验:RCU 保护一个链表(WSL2 可跑)</h2>
+
+  <p>
+    目标:用 RCU 保护一个全局链表头。加载时建 3 个节点,模块里用 <code>synchronize_rcu</code> + <code>kfree_rcu</code>
+    演示"换头+延迟回收"。<strong>这是你第一次写读侧零锁的代码</strong>——感受读者不持任何锁就能安全遍历。
+  </p>
+
+  <pre><code><span class="com">// bt_rcu.c — 第 8 课实验:RCU 保护全局链表头</span>
+<span class="kw">#include</span> &lt;linux/module.h&gt;
+<span class="kw">#include</span> &lt;linux/kernel.h&gt;
+<span class="kw">#include</span> &lt;linux/slab.h&gt;
+<span class="kw">#include</span> &lt;linux/list.h&gt;
+<span class="kw">#include</span> &lt;linux/rcupdate.h&gt;
+
+<span class="kw">struct</span> bt_item {
+    <span class="type">int</span>              v;
+    <span class="kw">struct</span> list_head list;
+};
+
+<span class="com">/* 受 RCU 保护的全局链表头指针(指向一个动态分配的 head 节点结构) */</span>
+<span class="kw">static</span> <span class="kw">struct</span> list_head __rcu *g_head;
+
+<span class="com">/* 读者:零锁遍历 */</span>
+<span class="kw">static</span> <span class="type">void</span> reader(<span class="type">void</span>)
+{
+    <span class="kw">struct</span> list_head *head;
+    <span class="kw">struct</span> bt_item *it;
+
+    rcu_read_lock();
+    head = rcu_dereference(g_head);          <span class="com">// 安全取指针</span>
+    list_for_each_entry(it, head, list)      <span class="com">// 遍历——不持任何锁!</span>
+        pr_info(<span class="str">"bt_rcu 读: v=%d\n"</span>, it-&gt;v);
+    rcu_read_unlock();
+}
+
+<span class="com">/* 写者:整体替换链表头(模拟"换一份数据"),旧的延迟释放 */</span>
+<span class="kw">static</span> <span class="type">void</span> replace_head(<span class="kw">struct</span> list_head *new_head)
+{
+    <span class="kw">struct</span> list_head *old;
+    old = rcu_dereference_protected(g_head, lockdep_is_held(&amp;some_lock)); <span class="com">// 写侧用 protected 版</span>
+    rcu_assign_pointer(g_head, new_head);    <span class="com">// 发布新指针</span>
+    synchronize_rcu();                       <span class="com">// 等宽限期</span>
+    kfree(old);                              <span class="com">// 安全释放旧 head</span>
+}
+
+<span class="kw">static</span> <span class="type">int</span> __init bt_rcu_init(<span class="type">void</span>)
+{
+    <span class="kw">struct</span> list_head *h;
+    <span class="kw">int</span> i;
+    h = kmalloc(<span class="kw">sizeof</span>(*h), GFP_KERNEL);
+    INIT_LIST_HEAD(h);
+    <span class="kw">for</span> (i = <span class="kw">0</span>; i &lt; <span class="kw">3</span>; i++) {
+        <span class="kw">struct</span> bt_item *it = kmalloc(<span class="kw">sizeof</span>(*it), GFP_KERNEL);
+        it-&gt;v = i;
+        list_add_tail(&amp;it-&gt;list, h);
+    }
+    rcu_assign_pointer(g_head, h);
+    pr_info(<span class="str">"bt_rcu: 加载,读一次:\n"</span>);
+    reader();
+    <span class="kw">return</span> <span class="kw">0</span>;
+}
+
+<span class="kw">static</span> <span class="type">void</span> __exit bt_rcu_exit(<span class="type">void</span>)
+{
+    <span class="kw">struct</span> list_head *h = rcu_dereference_protected(g_head, <span class="kw">1</span>);
+    <span class="kw">struct</span> bt_item *it, *tmp;
+    list_for_each_entry_safe(it, tmp, h, list) {
+        list_del(&amp;it-&gt;list);
+        kfree(it);
+    }
+    synchronize_rcu();
+    kfree(h);
+    pr_info(<span class="str">"bt_rcu: 卸载\n"</span>);
+}
+module_init(bt_rcu_init);
+module_exit(bt_rcu_exit);
+MODULE_LICENSE(<span class="str">"GPL"</span>);
+MODULE_DESCRIPTION(<span class="str">"Lesson 8: RCU-protected list demo"</span>);</code></pre>
+
+  <aside class="callout tip">
+    <span class="callout-title">观察重点</span>
+    <p><code>reader()</code> 里<strong>没有任何锁</code>——<code>rcu_read_lock</code> 在非抢占内核下连原子指令都没有。这就是"读者零开销"的真实代码。
+    你以后读网络协议栈、路由表、进程 <code>task_struct</code> 链表的代码,全是这个模式。</p>
+  </aside>
+
+
+  <h2 id="check">检验理解</h2>
+
+  <div class="quiz" data-correct="b" data-explain="RCU 的精髓是让写者付费:写者复制一份新数据、原子换指针、然后等一个宽限期(synchronize_rcu),确保所有'正读旧版本'的读者都退出后再 kfree 旧数据。读者持旧指针读旧数据是安全的——只要旧数据还没被释放。读侧因此可以不加任何锁(非抢占内核下 rcu_read_lock≈preempt_disable,无原子指令)。'读者加读锁''写者抢锁''轮询'都不对。">
+    <p class="quiz-q">RCU 是怎么做到"读者完全不加锁"的?</p>
+    <label class="quiz-opt"><input type="radio" name="q1" value="a">读者加一把特殊的读锁</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="b">写者延迟回收旧数据,读者读旧版安全</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="c">写者加锁,读者轮询</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="d">读者和写者都用 atomic</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="c" data-explain="rcu_dereference 与 rcu_assign_pointer 成对处理发布-订阅的内存顺序:assign 在换指针前插写屏障(保证新数据先于指针对其他核可见),dereference 在取指针后保证先取指针再取其指向的数据(Alpha 上需硬件屏障,其他架构靠地址依赖)。这解决了 CPU/编译器乱序导致的'看到新指针却读到未初始化数据'。与抢占、缓存无关——抢占是读侧免锁的基础(rcu_read_lock≈preempt_disable),不是 dereference 的作用。">
+    <p class="quiz-q">rcu_dereference 和 rcu_assign_pointer 解决了什么问题?</p>
+    <label class="quiz-opt"><input type="radio" name="q2" value="a">让读者能睡眠</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="b">避免缓存抖动</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="c">保证发布-订阅的内存顺序</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="d">禁止本核被抢占</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+
+  <h2 id="chapter-end">知识储备篇 · 真正的终章小结</h2>
+
+  <p>八课下来,你集齐了读内核源码、写驱动、进三大核心篇所需的<strong>全部基础</strong>:</p>
+
+  <table>
+    <thead><tr><th>课</th><th>主题</th><th>核心收获</th></tr></thead>
+    <tbody>
+      <tr><td>1–3</td><td>数据结构</td><td>list_head / hlist / rbtree + 关系建模</td></tr>
+      <tr><td>4–5</td><td>中断 + 时间</td><td>上下文铁律、上半部/下半部、jiffies/hrtimer</td></tr>
+      <tr><td>6</td><td>设计模式</td><td>模板方法(file_operations) + 观察者(notifier)</td></tr>
+      <tr><td>7–8</td><td>同步</td><td>spinlock/mutex/seqlock/percpu/atomic + RCU</td></tr>
+    </tbody>
+  </table>
+
+  <p>这套基础<strong>互相印证</strong>:RCU 读侧用 preempt_disable、rcu_dereference 用屏障、file_operations 是模板方法、
+  task_struct 的链表用 list_head……你现在已经能读懂内核里相当一部分基础设施代码了。</p>
+
+  <aside class="callout">
+    <span class="callout-title">下一站:内存管理篇(§5–9)</span>
+    <p>从第 9 课起正式进入<strong>内存管理篇</strong>:内存寻址(§5)、物理内存管理(伙伴系统,§6)、虚拟内存(§7)、
+    slab/缺页/COW(§8)、内存回收(§9)。这是<strong>驱动开发的头号痛点</strong>——你写驱动时每个 <code>kzalloc</code>、
+    每次 DMA 映射、每个 page fault 都跟它有关,也是晋升内核/BSP 岗最核心的能力。知识储备篇打牢了,这一篇会更有底气。</p>
+  </aside>
+
+  <aside class="callout">
+    <span class="callout-title">推荐精读</span>
+    <ul style="margin-bottom:0">
+      <li>官方:<a href="https://docs.kernel.org/RCU/whatisRCU.html" target="_blank" rel="noopener">What is RCU?</a>(权威入门)、<a href="https://docs.kernel.org/RCU/Design/Requirements/Requirements.html" target="_blank" rel="noopener">A Tour Through RCU's Requirements</a>(三大保证)、<a href="https://docs.kernel.org/RCU/Design/Memory-Ordering/Tree-RCU-Memory-Ordering.html" target="_blank" rel="noopener">Tree-RCU Memory Ordering</a></li>
+      <li>LWN 必读:<a href="https://lwn.net/Articles/652156/" target="_blank" rel="noopener">Requirements for RCU part 1</a>(宽限期代码级)、<a href="https://lwn.net/Articles/988638/" target="_blank" rel="noopener">The RCU API, 2024 edition</a>(API 全景)</li>
+      <li>本书 §B.2.12 RCU、§B.2.3 屏障、§B.2.6 禁抢占</li>
+    </ul>
+  </aside>
+
+  <h3>带着这些问题进入内存管理篇</h3>
+  <ul>
+    <li><strong>你写驱动调 <code>kzalloc</code> 得到的内存,物理上是怎么管理的?</strong>——伙伴系统(§6)。</li>
+    <li><strong>虚拟地址怎么变成物理地址?MMU、页表、TLB 各管什么?</strong>——内存寻址(§5)。</li>
+    <li><strong>malloc 很大的内存,内核是马上分配物理页还是懒分配?</strong>——缺页异常 + COW(§8)。</li>
+  </ul>
+
+  <p class="lesson-nav">
+    <a href="0007-synchro-basics.html">← 第 7 课:同步基础</a>
+    <a href="#">第 9 课:内存寻址(待生成)→</a>
+  </p>
+
+  <hr>
+  <p style="font-family:var(--sans);font-size:.85rem;color:var(--ink-mute);">
+    实验跑通后告诉我:RCU 读侧零锁的代码读懂了吗?宽限期的概念清楚了吗?
+    准备好进入<strong>内存管理篇</strong>就说"继续"——这是驱动开发最核心、对你价值最高的一篇,我们从内存寻址(§5)开始。
+  </p>
+
+</div>
+</body>
+</html>

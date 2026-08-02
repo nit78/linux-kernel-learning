@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 7 课 · 内核同步基础</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/quiz.js" defer></script>
+<script src="../assets/notes.js" defer></script>
+<style>
+  .racefig {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1.3rem 0;
+    color: var(--ink);
+  }
+  .racefig .dim { color: var(--ink-mute); }
+  .racefig .hl  { color: var(--accent); font-weight: 600; }
+  .racefig .ok  { color: var(--ok); font-weight: 600; }
+  .racefig .err { color: var(--err); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="lesson-meta">
+    <span class="chip">第 7 课</span>
+    <span class="chip">附录 B · 内核同步</span>
+    <span class="chip">覆盖 §B.1 竞争 / §B.2.1–§B.2.11 基础原语</span>
+    <span class="chip">RCU(§B.2.12)见第 8 课</span>
+    <span class="chip">Linux 6.6 (你的环境)</span>
+    <a href="../reference/glossary.html">术语表</a>
+  </p>
+
+  <h1>内核同步基础:SMP 时代的竞争与锁</h1>
+
+  <p>
+    这是附录 B 内核同步的<strong>上半篇</strong>。附录 B 不是书的"正文章节",却是<strong>三大核心篇的必备前置</strong>——
+    内存管理、进程调度、文件系统每一处都要用锁。这课讲清"为什么需要锁、有哪些锁、何时用哪个";
+    下一课(第 8 课)单独深讲 RCU(§B.2.12),它是内核最精巧、最值得专门一课的同步机制。
+  </p>
+
+  <aside class="callout tip">
+    <span class="callout-title">连接点</span>
+    同步的根基是第 4 课的<strong>上下文铁律</strong>:"能不能睡眠看上下文"。这课整张选型表,本质上都在回答
+    "我当前在什么上下文 → 我能用哪种锁"。你的 MCU 单核经验里锁很简单,内核的复杂全来自 SMP + 中断 + 抢占的组合。
+  </aside>
+
+
+  <h2 id="why-synchro">§B.1 为什么内核需要同步</h2>
+
+  <p><strong>一句话</strong>:多个执行流(CPU 核、中断、线程)<strong>同时</strong>访问<strong>同一份</strong>共享数据,结果会错。</p>
+
+  <p>你在 MCU 单核上很少操心这个——一次只有一个执行流。但内核跑在 SMP(多核)上,竞争来自三个维度叠加:</p>
+
+  <table>
+    <thead><tr><th>竞争来源</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>多 CPU 核</td><td>核 0 和核 1 真的同时读写同一变量</td></tr>
+      <tr><td>中断</td><td>进程正在改数据时,中断打断进来也改它</td></tr>
+      <tr><td>抢占</td><td>进程 A 改数据到一半被调度走,进程 B 接着改</td></tr>
+    </tbody>
+  </table>
+
+  <p>看一个最典型的竞争——`count++` 不是原子的:</p>
+
+  <div class="racefig">count++ 的竞争(读-改-写三步,中间能被打断)
+
+  count = 0
+  <span class="hl">CPU 核 0: 读 count (得 0)</span>     <span class="hl">CPU 核 1: 读 count (也得 0!)</span>
+  <span class="hl">CPU 核 0: 加 1       (得 1)</span>     <span class="hl">CPU 核 1: 加 1       (也得 1)</span>
+  <span class="hl">CPU 核 0: 写回 count (=1)</span>      <span class="hl">CPU 核 1: 写回 count (=1)</span>
+
+  <span class="err">结果:两次 ++ 只涨了 1。这就是竞争(race condition)。</span>
+  <span class="dim">解法:把"读-改-写"包成不可分割的原子操作,或加锁。</span></div>
+
+
+  <h2 id="no-lock">先看免锁的招数(§B.2.1–§B.2.4)</h2>
+
+  <p>加锁有开销,内核先尽量"不加锁"。四种常用免锁手段:</p>
+
+  <h3>§B.2.1 每 CPU 变量(percpu)——各核各一份</h3>
+  <pre><code><span class="com">// 给每个 CPU 核一份独立副本,写自己的不会竞争</span>
+<span class="kw">static</span> DEFINE_PER_CPU(<span class="type">unsigned</span> <span class="type">long</span>, bt_counter);
+
+<span class="com">// 当前核上加:无需锁!</span>
+<span class="kw">this_cpu_inc</span>(bt_counter);
+
+<span class="com">// 要总数时再加起来(此时才需考虑同步)</span>
+<span class="type">unsigned</span> <span class="type">long</span> total = <span class="kw">0</span>;
+<span class="kw">int</span> cpu;
+<span class="kw">for_each_possible_cpu</span>(cpu)
+    total += per_cpu(bt_counter, cpu);</code></pre>
+  <p>适合<strong>高频计数器/统计</strong>。只要每个核只动自己的副本,就零竞争。</p>
+
+  <h3>§B.2.2 volatile——内核不推荐你写它</h3>
+  <p>本书会介绍 <code>volatile</code>,但<strong>内核明确不推荐</strong>用裸 <code>volatile</code> 做并发通信
+  (编译器语义不够、易错)。现代替代是下面的 <code>READ_ONCE</code>/<code>WRITE_ONCE</code>。读老代码会遇到 <code>volatile</code>,要能看懂,但别新写。</p>
+
+  <h3>§B.2.3 内存屏障(memory barrier)</h3>
+  <p>编译器和 CPU 都会<strong>乱序</strong>读写(为了性能)。需要严格顺序时插屏障:
+  <code>smp_mb()</code>(全屏障)、<code>smp_rmb()</code>(读屏障)、<code>smp_wmb()</code>(写屏障)。
+  进阶话题,这课不展开,第 8 课讲 RCU 时会涉及。日常用 <code>READ_ONCE</code>/<code>WRITE_ONCE</code> 即可。</p>
+
+  <h3>§B.2.4 原子变量(atomic_t)——单变量的原子读-改-写</h3>
+  <pre><code><span class="kw">#include</span> &lt;linux/atomic.h&gt;
+<span class="kw">atomic_t</span> bt_count = ATOMIC_INIT(<span class="kw">0</span>);
+
+atomic_inc(&amp;bt_count);              <span class="com">// 原子 +1</span>
+atomic_add(<span class="kw">5</span>, &amp;bt_count);          <span class="com">// 原子 +5</span>
+<span class="kw">int</span> v = atomic_read(&amp;bt_count);    <span class="com">// 原子读</span>
+<span class="kw">if</span> (atomic_inc_return(&amp;bt_count) == <span class="kw">1</span>) { ... }   <span class="com">// 原子 +1 并返回新值</span></code></pre>
+  <p>单变量的 <code>++/--/add/read</code> 都有原子版,无需锁。比 percpu 重,但跨核。</p>
+
+  <aside class="callout">
+    <span class="callout-title">READ_ONCE / WRITE_ONCE(现代推荐)</span>
+    <p>对<strong>单个变量</strong>的并发访问(只需"读/写本身不被编译器拆碎",不要求读-改-写原子),内核推荐用
+    <code>READ_ONCE(x)</code> / <code>WRITE_ONCE(x, v)</code>——它们防编译器<strong>撕裂/融合/消除</strong>读写,
+    相当于 C11 的 <code>memory_order_relaxed</code>。比裸读、裸写、<code>volatile</code> 都更明确。
+    读写场景常这样配:<code>WRITE_ONCE(flag, 1)</code> 在一边,<code>while(!READ_ONCE(flag))</code> 在另一边。</p>
+  </aside>
+
+
+  <h2 id="locks">两把主力锁:spinlock 与 mutex</h2>
+
+  <p>多变量、复合操作,免锁手段不够,就用锁。内核两把主力:</p>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>spinlock(自旋锁)</h4>
+      <p>抢不到就<strong>忙等</strong>(CPU 空转循环重试)。<strong>绝不睡眠</strong>。</p>
+      <p>适用:<strong>短</strong>临界区;中断上下文也能用(因为它不睡)。</p>
+      <p>代价:持锁期间本核会忙等;持锁时绝不能睡眠(否则死锁——其他核会死等)。</p>
+    </div>
+    <div class="col">
+      <h4>mutex(互斥锁)</h4>
+      <p>抢不到就<strong>睡眠让出 CPU</strong>,被唤醒后再来。</p>
+      <p>适用:<strong>长</strong>临界区;仅<strong>进程上下文</strong>(因为它会睡)。</p>
+      <p>代价:睡眠/唤醒有调度开销;中断上下文绝不能用。</p>
+    </div>
+  </div>
+
+  <p><strong>选型核心又是第 4 课的上下文铁律</strong>:临界区里要睡眠(分配大内存、做 I/O)→ mutex;
+  临界区不能睡(在中断、软中断里)→ spinlock。</p>
+
+  <h3 id="spinlock-variants">§B.2.7 自旋锁的四个变体(关键)</h3>
+
+  <p>spinlock 最让人晕的是它有四个变体,差别在<strong>持锁时还要不要关中断/软中断</strong>:</p>
+
+  <table>
+    <thead><tr>
+      <th>变体</th><th>关中断?</th><th>关软中断?</th><th>保存状态?</th><th>何时用</th>
+    </tr></thead>
+    <tbody>
+      <tr><td><code>spin_lock()</code></td><td>否</td><td>否</td><td>—</td><td>锁<strong>绝不会</strong>在中断上下文被获取</td></tr>
+      <tr><td><code>spin_lock_bh()</code></td><td>否</td><td>✅</td><td>—</td><td>数据与<strong>软中断/tasklet</strong>共享(§B.2.5)</td></tr>
+      <tr><td><code>spin_lock_irq()</code></td><td>✅</td><td>✅</td><td>否</td><td>确定进入前中断是<strong>开</strong>的</td></tr>
+      <tr><td><code>spin_lock_irqsave()</code></td><td>✅</td><td>✅</td><td>✅</td><td><strong>最通用安全</strong>:锁可能在中断上下文被获取</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>为什么有 <code>irqsave</code>?</strong> 想象你的锁可能在中断里被获取:进程持锁 → 中断来 →
+  中断也想要这把锁 → 死锁(进程被中断打断、又没法释放锁)。解法是进程持锁时<strong>先关本核中断</strong>。
+  <code>irqsave</code> 额外保存了之前的中断状态,以便 unlock 时<strong>恢复原状</strong>(可能进来时中断本来就是关的)。</p>
+
+  <aside class="callout warn">
+    <span class="callout-title">实战建议</span>
+    <p>不确定时,优先 <code>spin_lock_irqsave(&amp;lock, flags)</code> / <code>spin_unlock_irqrestore(&amp;lock, flags)</code>——
+    它最安全,覆盖了所有情况。性能敏感的热路径才精挑细选更轻的变体。</p>
+  </aside>
+
+  <h3>§B.2.10 信号量 / §B.2.11 mutex 的 API</h3>
+  <pre><code><span class="com">// mutex(进程上下文、可睡眠)</span>
+DEFINE_MUTEX(bt_mutex);
+mutex_lock(&amp;bt_mutex);       <span class="com">// 获取,获取不到就睡眠</span>
+<span class="com">/* 临界区:可睡眠、可做 I/O */</span>
+mutex_unlock(&amp;bt_mutex);
+
+<span class="com">// 信号量:可用作"计数信号量"(允许 N 个同时进)或互斥(=mutex 的底层)</span>
+<span class="kw">struct</span> semaphore sem;
+sema_init(&amp;sem, <span class="kw">1</span>);         <span class="com">// 初值 1 = 互斥</span>
+down(&amp;sem);                 <span class="com">// 获取(可睡)</span>
+up(&amp;sem);                   <span class="com">// 释放 */</span></code></pre>
+
+
+  <h2 id="other-locks">§B.2.8–§B.2.9 其他锁:rwlock 与 seqlock</h2>
+
+  <p>当<strong>读多写少</strong>,普通锁会让所有读者互相阻塞,有更优结构:</p>
+
+  <table>
+    <thead><tr><th>结构</th><th>读者</th><th>写者</th><th>典型场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>rwlock</strong>(读写锁 §B.2.8)</td><td>共享(多读并发)</td><td>独占</td><td>读多写少,但写仍需等所有读</td></tr>
+      <tr><td><strong>seqlock</strong>(顺序锁 §B.2.9)</td><td><strong>无锁</strong>(读时记序号)</td><td>独占(写时序号++)</td><td>极少写、读者不要阻塞写(如时间戳、统计)</td></tr>
+    </tbody>
+  </table>
+
+  <p>seqlock 的精巧:读者<strong>不加锁</strong>,只在读前后各读一次序号;若两次序号不同(说明中间有写)或序号为奇数(写进行中),就<strong>重读</strong>。写者完全不被读者阻塞。</p>
+
+  <pre><code><span class="com">// seqlock 典型用法(读 x,写者可能正在改)</span>
+<span class="kw">unsigned</span> <span class="type">int</span> seq;
+<span class="type">u64</span> val;
+<span class="kw">do</span> {
+    seq = read_seqbegin(&amp;bt_seq);
+    val = READ_ONCE(bt_val);     <span class="com">// 顺手用 READ_ONCE</span>
+} <span class="kw">while</span> (read_seqretry(&amp;bt_seq, seq));   <span class="com">// 中途被写打扰就重来</span>
+
+<span class="com">// 写者:</span>
+write_seqlock(&amp;bt_seq);
+bt_val = new_value;
+write_sequnlock(&amp;bt_seq);</code></pre>
+
+
+  <h2 id="select">一张表收尾:何时用什么</h2>
+
+  <table>
+    <thead><tr><th>场景</th><th>用</th><th>理由</th></tr></thead>
+    <tbody>
+      <tr><td>单变量 ++/--/add</td><td><code>atomic_t</code></td><td>免锁,跨核</td></tr>
+      <tr><td>每核高频计数</td><td>percpu + <code>this_cpu_inc</code></td><td>零竞争</td></tr>
+      <tr><td>单变量并发读写(不需读改写原子)</td><td><code>READ_ONCE</code>/<code>WRITE_ONCE</code></td><td>防编译器拆碎</td></tr>
+      <tr><td>短临界区、可能在中断里</td><td><code>spin_lock_irqsave</code></td><td>不睡+关中断</td></tr>
+      <tr><td>短临界区、确定不沾中断</td><td><code>spin_lock</code></td><td>最轻</td></tr>
+      <tr><td>长临界区、要睡眠/做 I/O</td><td><code>mutex</code></td><td>可睡、仅进程上下文</td></tr>
+      <tr><td>读多写少、要并发读</td><td>rwlock / seqlock</td><td>读者不互斥</td></tr>
+      <tr><td>读极多写极少、读者别阻塞写</td><td>seqlock</td><td>读者无锁重试</td></tr>
+      <tr><td>读极多写极少、指针替换为主</td><td><strong>RCU</strong>(第 8 课)</td><td>读者零开销</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>心智模型</strong>:先问"共享数据长什么样"——单变量?多变量?读多还是写多?再问"我在什么上下文"——能不能睡?——选型就出来了。</p>
+
+
+  <h2 id="lab">动手实验:percpu vs spinlock 的开销(WSL2 可跑)</h2>
+
+  <p>
+    目标:同一个计数器,分别用 percpu 和 spinlock 实现,各加 1000 万次,对比耗时。
+    你会<strong>亲手量到锁的开销</strong>——这是"为什么内核要发明这么多免锁招数"的第一手证据。
+  </p>
+
+  <pre><code><span class="com">// bt_sync.c — 第 7 课实验:percpu vs spinlock 计数器开销</span>
+<span class="kw">#include</span> &lt;linux/module.h&gt;
+<span class="kw">#include</span> &lt;linux/kernel.h&gt;
+<span class="kw">#include</span> &lt;linux/percpu.h&gt;
+<span class="kw">#include</span> &lt;linux/spinlock.h&gt;
+<span class="kw">#include</span> &lt;linux/ktime.h&gt;
+
+<span class="kw">static</span> DEFINE_PER_CPU(<span class="type">unsigned</span> <span class="type">long</span>, bt_pcpu);
+<span class="kw">static</span> <span class="type">unsigned</span> <span class="type">long</span> __percpu *bt_pcpu_ptr;
+<span class="kw">static</span> DEFINE_SPINLOCK(bt_lock);
+<span class="kw">static</span> <span class="type">unsigned</span> <span class="type">long</span> bt_shared;
+<span class="kw">#define</span> N 10000000UL
+
+<span class="kw">static</span> <span class="type">void</span> bench_percpu(<span class="type">void</span>)
+{
+    <span class="type">int</span> i; ktime_t t = ktime_get();
+    <span class="kw">for</span> (i = <span class="kw">0</span>; i &lt; N; i++)
+        <span class="kw">this_cpu_inc</span>(*bt_pcpu_ptr);
+    pr_info(<span class="str">"bt_sync: percpu   %lu 次耗时 %lld ns\n"</span>, N, ktime_to_ns(ktime_sub(ktime_get(), t)));
+}
+
+<span class="kw">static</span> <span class="type">void</span> bench_spinlock(<span class="type">void</span>)
+{
+    <span class="type">int</span> i; <span class="type">unsigned</span> <span class="type">long</span> flags; ktime_t t = ktime_get();
+    <span class="kw">for</span> (i = <span class="kw">0</span>; i &lt; N; i++) {
+        spin_lock_irqsave(&amp;bt_lock, flags);
+        bt_shared++;
+        spin_unlock_irqrestore(&amp;bt_lock, flags);
+    }
+    pr_info(<span class="str">"bt_sync: spinlock %lu 次耗时 %lld ns\n"</span>, N, ktime_to_ns(ktime_sub(ktime_get(), t)));
+}
+
+<span class="kw">static</span> <span class="type">int</span> __init bt_sync_init(<span class="type">void</span>)
+{
+    bt_pcpu_ptr = alloc_percpu(<span class="type">unsigned</span> <span class="type">long</span>);
+    <span class="kw">if</span> (!bt_pcpu_ptr) <span class="kw">return</span> -ENOMEM;
+    pr_info(<span class="str">"bt_sync: 加载,开始 %lu 次累加对比\n"</span>, N);
+    bench_percpu();
+    bench_spinlock();
+    pr_info(<span class="str">"bt_sync: shared=%lu percpu 总和=%lu\n"</span>, bt_shared,
+            bt_pcpu_ptr[<span class="kw">0</span>] + bt_pcpu_ptr[<span class="kw">1</span>] + (nr_cpu_ids &gt; <span class="kw">2</span> ? bt_pcpu_ptr[<span class="kw">2</span>] : <span class="kw">0</span>));
+    <span class="kw">return</span> <span class="kw">0</span>;
+}
+
+<span class="kw">static</span> <span class="type">void</span> __exit bt_sync_exit(<span class="type">void</span>)
+{
+    free_percpu(bt_pcpu_ptr);
+    pr_info(<span class="str">"bt_sync: 卸载\n"</span>);
+}
+module_init(bt_sync_init);
+module_exit(bt_sync_exit);
+MODULE_LICENSE(<span class="str">"GPL"</span>);
+MODULE_DESCRIPTION(<span class="str">"Lesson 7: percpu vs spinlock cost"</span>);</code></pre>
+
+  <ol class="steps">
+    <li><code>make</code> → <code>bt_sync.ko</code></li>
+    <li><code>sudo insmod bt_sync.ko</code></li>
+    <li><code>dmesg | tail</code> —— 应看到两行耗时,<strong>percpu 明显快于 spinlock</strong>(差几倍很正常)</li>
+    <li><code>sudo rmmod bt_sync</code></li>
+  </ol>
+
+  <aside class="callout tip">
+    <span class="callout-title">观察重点</span>
+    <p>percpu 快,是因为它<strong>零竞争</strong>(只动自己核的副本);spinlock 慢,是因为每次 <code>spin_lock_irqsave</code>
+    都要关中断 + 原子操作 + (可能)等别的核。<strong>这就是内核发明 percpu / atomic / RCU 这些免锁/轻锁机制的回报</strong>——
+    在热路径上,几倍的开销差距是真实可感的。这个数字你亲眼看到了,以后选型就有直觉。</p>
+  </aside>
+
+
+  <h2 id="check">检验理解</h2>
+
+  <div class="quiz" data-correct="b" data-explain="spinlock 的根本约束是持锁期间绝不能睡眠:若睡,本核不再运行(无法释放锁),而在另一核上等这把锁的代码会死循环等下去——死锁。中断上下文不能睡眠(第 4 课),所以只能用不睡的 spinlock。mutex 会睡眠,中断里用必然死锁。'快'只是结果不是原因。">
+    <p class="quiz-q">为什么硬中断 ISR 里只能用 spinlock,不能用 mutex?</p>
+    <label class="quiz-opt"><input type="radio" name="q1" value="a">因为 spinlock 比 mutex 快</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="b">因为持锁不能睡眠,mutex 会睡</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="c">因为 mutex 占内存更多</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="d">因为 ISR 里没有 current</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="c" data-explain="如果一把锁可能在进程上下文和中断上下文都被获取,进程持锁时必须先关本核中断,否则:进程持锁→中断打断→中断也要这把锁→死锁(进程被中断打断没法释放,中断死等)。spin_lock_irqsave 正是为此:关中断+保存原状态。spin_lock() 不关中断会死锁;spin_lock_bh 只关软中断不够;mutex 不能用在中断上下文。">
+    <p class="quiz-q">一把锁既在进程上下文、又可能在硬中断里被获取,应该用哪个变体?</p>
+    <label class="quiz-opt"><input type="radio" name="q2" value="a">spin_lock()</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="b">spin_lock_bh()</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="c">spin_lock_irqsave()</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="d">mutex_lock()</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+
+  <h2 id="next">接下来</h2>
+
+  <p>
+    这一课覆盖了附录 B 的<strong>基础原语</strong>:percpu / atomic / READ_ONCE-WRITE_ONCE /
+    spinlock(四变体)/ mutex / rwlock / seqlock。这套足以让你读懂内核里<strong>绝大多数</strong>锁用法。
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">下一站:第 8 课 RCU(§B.2.12)</span>
+    <p>RCU(Read-Copy-Update)是内核<strong>最精巧</strong>的同步机制——读者<strong>完全不加锁、零开销</strong>,
+    写者先复制再改、择机回收旧版本。它撑起了路由表、进程链表等"读极多写极少"的核心数据结构。
+    值得单独一课深讲:原理(宽限期/优雅周期)、API、何时用、与 seqlock 的区别。</p>
+  </aside>
+
+  <aside class="callout">
+    <span class="callout-title">推荐精读</span>
+    <ul style="margin-bottom:0">
+      <li>官方文档:<a href="https://docs.kernel.org/locking/locktypes.html" target="_blank" rel="noopener">Lock types and their rules</a>(锁类型权威)、<a href="https://docs.kernel.org/core-api/wrappers/memory-barriers.html" target="_blank" rel="noopener">Memory barriers</a>(READ_ONCE/WRITE_ONCE/屏障)</li>
+      <li>经典:<a href="https://www.kernel.org/doc/Documentation/kernel-hacking/locking.rst" target="_blank" rel="noopener">kernel-hacking locking.rst</a>(实战向)、<a href="https://www.kernel.org/doc/Documentation/locking/spinlocks.txt" target="_blank" rel="noopener">spinlocks.txt</a></li>
+      <li>本书附录 B「内核同步」,图解各原语</li>
+    </ul>
+  </aside>
+
+  <h3>带着这些问题进入第 8 课(RCU)</h3>
+  <ul>
+    <li><strong>读者完全不加锁,怎么能安全地读一个"正在被改"的数据?</strong>——RCU 的核心魔法。</li>
+    <li><strong>写者改完旧数据后,什么时候真正释放它?怎么确定所有读者都读完了?</strong>——宽限期。</li>
+    <li><strong>RCU 和 seqlock 都处理"读多写少",区别在哪?</strong></li>
+  </ul>
+
+  <p class="lesson-nav">
+    <a href="0006-design-patterns.html">← 第 6 课:设计模式</a>
+    <a href="0008-rcu.html">第 8 课:RCU →</a>
+  </p>
+
+  <hr>
+  <p style="font-family:var(--sans);font-size:.85rem;color:var(--ink-mute);">
+    实验跑通后告诉我:percpu 比 spinlock 快多少?两个 quiz 都答对了吗?
+    RCU 那课要不要我顺手把内存屏障(smp_mb/rmb/wmb)一起讲透(它和 RCU 的宽限期关系密切)?说"继续"即可。
+  </p>
+
+</div>
+</body>
+</html>
