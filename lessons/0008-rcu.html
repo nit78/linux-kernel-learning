@@ -116,6 +116,43 @@ rcu_read_unlock();                            <span class="com">// 退出</span>
     </tbody>
   </table>
 
+  <aside class="callout warn">
+    <span class="callout-title">⚠ 纠偏:单核真的不需要 RCU 吗?</span>
+    <p>
+      很多教程(包括本课旧版)说"单核用不上 RCU"——这话<strong>在抢占式单核内核下是错的</strong>。
+      内核官方文档 <a href="https://docs.kernel.org/RCU/UP.html" target="_blank" rel="noopener">RCU on Uniprocessor Systems</a> 明确区分两种情况:
+    </p>
+    <table>
+      <thead><tr><th>单核配置</th><th><code>synchronize_rcu()</code> 能立即返回吗</th><th>竞争存在吗</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>UP + 非抢占</strong><br><code>PREEMPT_NONE</code></td>
+          <td><span class="ok">✅ 能</span><br>读临界区内不发生切换,阻塞即度宽限期</td>
+          <td><span class="ok">不存在</span></td>
+        </tr>
+        <tr>
+          <td><strong>UP + 抢占</strong><br><code>CONFIG_PREEMPT_RCU</code></td>
+          <td><span class="err">❌ 不能</span><br>必须等被抢占的读者真正退出</td>
+          <td><span class="err">✅ 存在</span></td>
+        </tr>
+      </tbody>
+    </table>
+    <p><strong>官方文档原文</strong>(<a href="https://docs.kernel.org/RCU/UP.html" target="_blank" rel="noopener">RCU/UP.html</a>):</p>
+    <blockquote style="border-left:3px solid var(--accent);margin:.5rem 0;padding:.3rem .8rem;background:var(--accent-soft);font-size:.9rem">
+      "...it is safe for <code>synchronize_rcu()</code> to return immediately on UP systems, including PREEMPT SMP builds running on UP systems."<br><br>
+      "Because some other task might have been preempted in the middle of an RCU read-side critical section. If <code>synchronize_rcu()</code> simply immediately returned, it would prematurely signal the end of the grace period... which would come as a nasty shock to that other thread when it started running again."
+    </blockquote>
+    <p><strong>翻译要点</strong>:UP(单核)+ 非抢占内核下,<code>synchronize_rcu()</code> 可安全立即返回;但 UP + 抢占内核(<code>CONFIG_PREEMPT_RCU</code>)下,
+    <strong>另一任务可能正被抢占在 RCU 读临界区中间</strong>——若此时立即返回,等于过早结束宽限期,被抢占的读者恢复运行时它正在读的数据已被释放(use-after-free)。</p>
+    <p><strong>为什么这不是多核才有的问题</strong>:竞争的本质是"操作不是原子的,被打断了"。打断者可以是<strong>另一个 CPU</strong>(多核)、
+    也可以是<strong>调度器抢占</strong>(单核抢占式内核)。后者正是你前面学的"任务切换竞争"——单核抢占式内核下完全可能发生。</p>
+    <p style="margin-bottom:0"><strong>精确结论</strong>(取代"单核用不上 RCU"的说法):</p>
+    <ul style="margin-bottom:0">
+      <li>RCU 的<strong>内存屏障部分</strong>(<code>smp_wmb</code>/<code>smp_rmb</code>)——多核专用,单核退化</li>
+      <li>RCU 的<strong>延迟回收机制</strong>(宽限期 + 延迟 <code>kfree</code>)——<strong>单核抢占式内核下同样必要且有效</strong></li>
+    </ul>
+  </aside>
+
   <aside class="callout">
     <span class="callout-title">§B.2.6 禁抢占(preempt_disable)的本质</span>
     <p><code>preempt_disable()</code> 阻止当前任务被抢占(不会被打断切走),直到 <code>preempt_enable()</code>。
@@ -350,7 +387,7 @@ MODULE_DESCRIPTION(<span class="str">"Lesson 8: RCU-protected list demo"</span>)
 
   <p class="lesson-nav">
     <a href="0007-synchro-basics.html">← 第 7 课:同步基础</a>
-    <a href="#">第 9 课:内存寻址(待生成)→</a>
+    <a href="0009-memory-addressing.html">第 9 课:内存寻址 →</a>
   </p>
 
   <hr>
