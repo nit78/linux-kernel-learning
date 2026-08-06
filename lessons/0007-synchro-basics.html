@@ -243,8 +243,21 @@ write_sequnlock(&amp;bt_seq);</code></pre>
 
   <p>
     目标:同一个计数器,分别用 percpu 和 spinlock 实现,各加 1000 万次,对比耗时。
-    你会<strong>亲手量到锁的开销</strong>——这是"为什么内核要发明这么多免锁招数"的第一手证据。
+    你会<strong>亲手量到锁的"固定开销"</strong>——这是"为什么内核要发明这么多免锁招数"的第一手证据。
   </p>
+
+  <aside class="callout warn">
+    <span class="callout-title">先想清楚:这个实验到底在测什么?</span>
+    <p>
+      注意,这个循环<strong>只在单个 CPU 核、单个执行流</strong>里跑——<strong>没有真正的锁竞争</strong>(没别的核在等这把锁)。
+      那锁还有开销吗?<strong>有,而且不小。</strong>因为锁的开销 ≠ 只有"竞争等待":
+    </p>
+    <ul style="margin-bottom:0">
+      <li><code>spin_lock_irqsave</code> 每次仍要 <strong>关中断</strong> + 一条<strong>带 <code>lock</code> 前缀的原子指令</strong>(抢锁,即使无竞争也要独占缓存行) + <strong>内存屏障</strong>;解锁再来一遍。</li>
+      <li>percpu 的 <code>this_cpu_inc</code> 只动<strong>本核本地缓存行</strong>,几乎不跨核,无需关中断。</li>
+    </ul>
+    <p style="margin-bottom:0">所以本实验测的不是"竞争等待",而是<strong>"单次临界区进出的固定开销"</strong>——这恰恰是 percpu/atomic 在热路径上胜出的另一个理由(即使无竞争,锁本身也贵)。想看真正的"竞争开销",用下面的多核进阶实验。</p>
+  </aside>
 
   <pre><code><span class="com">// bt_sync.c — 第 7 课实验:percpu vs spinlock 计数器开销</span>
 <span class="kw">#include</span> &lt;linux/module.h&gt;
@@ -309,10 +322,82 @@ MODULE_DESCRIPTION(<span class="str">"Lesson 7: percpu vs spinlock cost"</span>)
 
   <aside class="callout tip">
     <span class="callout-title">观察重点</span>
-    <p>percpu 快,是因为它<strong>零竞争</strong>(只动自己核的副本);spinlock 慢,是因为每次 <code>spin_lock_irqsave</code>
-    都要关中断 + 原子操作 + (可能)等别的核。<strong>这就是内核发明 percpu / atomic / RCU 这些免锁/轻锁机制的回报</strong>——
-    在热路径上,几倍的开销差距是真实可感的。这个数字你亲眼看到了,以后选型就有直觉。</p>
+    <p>你会看到 spinlock 比 percpu 慢几倍——<strong>这个差距全来自锁的固定开销</strong>(关中断 + 原子指令独占缓存行 + 屏障),跟"竞争"无关(本实验单核跑、无竞争)。percpu 只动本核缓存行,所以便宜。<strong>这就是内核在热路径上偏好 percpu/atomic 的核心理由</strong>:即使无竞争,锁本身的进/出代价也太高。</p>
   </aside>
+
+  <h3 id="lab-contention" style="margin-top:1.8rem;">进阶(可选):真正测"竞争"的多核实验</h3>
+
+  <p>
+    上面的实验只测了固定开销。想看<strong>锁竞争</strong>的真实代价,要<strong>多核同时抢同一把锁</strong>。
+    下面这段用 <code>kthread</code> 起若干内核线程,绑到不同核上并发对同一个共享计数器累加——
+    抢同一把锁,你会看到耗时随核数上升而明显增长。
+  </p>
+
+  <pre><code><span class="com">// bt_contention.c — 第 7 课进阶:多核并发抢锁,测竞争开销</span>
+<span class="kw">#include</span> &lt;linux/module.h&gt;
+<span class="kw">#include</span> &lt;linux/kernel.h&gt;
+<span class="kw">#include</span> &lt;linux/spinlock.h&gt;
+<span class="kw">#include</span> &lt;linux/kthread.h&gt;
+<span class="kw">#include</span> &lt;linux/smp.h&gt;
+<span class="kw">#include</span> &lt;linux/ktime.h&gt;
+<span class="kw">#include</span> &lt;linux/delay.h&gt;
+
+<span class="kw">#define</span> NTHREADS  <span class="str">4</span>          <span class="com">// 起几个线程(可改成 nr_cpu_ids)</span>
+<span class="kw">#define</span> LOOP      2000000UL
+
+<span class="kw">static</span> DEFINE_SPINLOCK(cnt_lock);
+<span class="kw">static</span> <span class="type">unsigned</span> <span class="type">long</span> shared_cnt;
+<span class="kw">static</span> <span class="kw">struct</span> task_struct *threads[NTHREADS];
+<span class="kw">static</span> ktime_t t_start;
+<span class="kw">static</span> atomic_t done = ATOMIC_INIT(<span class="str">0</span>);
+
+<span class="kw">static</span> <span class="type">int</span> worker(<span class="type">void</span> *arg)
+{
+    <span class="type">int</span> i;
+    <span class="type">unsigned</span> <span class="type">long</span> flags;
+    <span class="kw">for</span> (i = <span class="str">0</span>; i &lt; LOOP; i++) {
+        spin_lock_irqsave(&amp;cnt_lock, flags);
+        shared_cnt++;
+        spin_unlock_irqrestore(&amp;cnt_lock, flags);
+    }
+    <span class="kw">if</span> (atomic_inc_return(&amp;done) == NTHREADS)
+        pr_info(<span class="str">"bt_cont: %d 线程各 %lu 次,共用时 %lld ns, shared=%lu\n"</span>,
+                NTHREADS, LOOP, ktime_to_ns(ktime_sub(ktime_get(), t_start)), shared_cnt);
+    <span class="kw">return</span> <span class="kw">0</span>;
+}
+
+<span class="kw">static</span> <span class="type">int</span> __init bt_cont_init(<span class="type">void</span>)
+{
+    <span class="type">int</span> i;
+    shared_cnt = <span class="str">0</span>;
+    atomic_set(&amp;done, <span class="str">0</span>);
+    pr_info(<span class="str">"bt_cont: 启动 %d 个内核线程抢同一把锁\n"</span>, NTHREADS);
+    t_start = ktime_get();
+    <span class="kw">for</span> (i = <span class="str">0</span>; i &lt; NTHREADS; i++) {
+        <span class="com">// kthread_run 默认让调度器分配核;线程数 ≤ 在线核数时通常会落到不同核</span>
+        threads[i] = kthread_run(worker, <span class="kw">NULL</span>, <span class="str">"bt_cont/%d"</span>, i);
+    }
+    <span class="kw">return</span> <span class="kw">0</span>;
+}
+
+<span class="kw">static</span> <span class="type">void</span> __exit bt_cont_exit(<span class="type">void</span>)
+{
+    <span class="com">// worker 很快跑完;kthread_run 创建的线程 return 后自动退出</span>
+    pr_info(<span class="str">"bt_cont: 卸载 (shared=%lu, 期望=%lu)\n"</span>, shared_cnt, (<span class="type">unsigned</span> <span class="type">long</span>)NTHREADS * LOOP);
+}
+module_init(bt_cont_init);
+module_exit(bt_cont_exit);
+MODULE_LICENSE(<span class="str">"GPL"</span>);
+MODULE_DESCRIPTION(<span class="str">"Lesson 7 advanced: spinlock contention across cores"</span>);</code></pre>
+
+  <aside class="callout">
+    <span class="callout-title">对比看点</span>
+    <p>把 NTHREADS 从 1 → 2 → 4 改,重跑。每个线程的循环量(LOOP)相同,但<strong>总耗时会随核数上升而明显增长</strong>——
+    这就是<strong>竞争开销</strong>:多个核抢同一把锁时,失败的核要忙等(或自旋),而且锁变量的缓存行在核之间反复迁移(cache line bouncing)。
+    这才是"锁竞争"的代价,跟第一个实验测的"固定开销"是两回事。两个实验一起做,你对锁开销的理解就完整了。</p>
+    <p style="margin-bottom:0"><strong>验证正确性</strong>:dmesg 里的 <code>shared</code> 应等于 <code>NTHREADS × LOOP</code>——锁保证了计数正确,但代价是并发度被锁串行化。</p>
+  </aside>
+
 
 
   <h2 id="check">检验理解</h2>
