@@ -149,10 +149,10 @@
     </p>
 
     <div class="progress-row">
-      <span class="chip done">已完成 8 课</span>
+      <span class="chip done">已完成 9 课</span>
       <span class="chip">当前: 内存管理篇</span>
-      <span class="chip">下一课: 物理内存模型</span>
-      <div class="progress-bar"><span style="width:35%"></span></div>
+      <span class="chip">下一课: 物理内存模型(页/zone/NUMA)</span>
+      <div class="progress-bar"><span style="width:39%"></span></div>
     </div>
   </header>
 
@@ -246,23 +246,31 @@
       驱动开发的头号痛点,对本课程价值最高。从页→zone→buddy→slab,到 kmalloc 家族与 page fault。
     </p>
     <ul class="lessons">
-      <li class="todo">
+      <li>
         <span class="num">0009</span>
-        <span class="title">物理内存模型:页、zone、NUMA<span class="topic">§5</span></span>
-        <span class="badge next">下一课</span>
+        <span class="title">
+          <a href="lessons/0009-memory-addressing.html">内存寻址:从虚拟地址到物理地址</a>
+          <span class="topic">§5.1-5.3 · MMU/多级页表(TLB)/ioremap</span>
+        </span>
+        <span class="badge done">已完成</span>
       </li>
       <li class="todo">
         <span class="num">0010</span>
+        <span class="title">物理内存模型:页、zone、NUMA<span class="topic">§5.4+</span></span>
+        <span class="badge next">下一课</span>
+      </li>
+      <li class="todo">
+        <span class="num">0011</span>
         <span class="title">伙伴系统 Buddy Allocator<span class="topic">§6</span></span>
         <span class="badge">待学</span>
       </li>
       <li class="todo">
-        <span class="num">0011</span>
+        <span class="num">0012</span>
         <span class="title">Slab/Slub:kmalloc 的来源<span class="topic">§7 · 驱动高频</span></span>
         <span class="badge">待学</span>
       </li>
       <li class="todo">
-        <span class="num">0012</span>
+        <span class="num">0013</span>
         <span class="title">虚拟地址与 page fault<span class="topic">§8–9</span></span>
         <span class="badge">待学</span>
       </li>
