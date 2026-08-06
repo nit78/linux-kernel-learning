@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 9 课 · 内存寻址</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/quiz.js" defer></script>
+<script src="../assets/notes.js" defer></script>
+<style>
+  .addrfig {
+    font-family: var(--mono);
+    font-size: .8rem;
+    line-height: 1.45;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 1rem;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 1.3rem 0;
+    color: var(--ink);
+  }
+  .addrfig .dim { color: var(--ink-mute); }
+  .addrfig .hl  { color: var(--accent); font-weight: 600; }
+  .addrfig .ok  { color: var(--ok); font-weight: 600; }
+  .addrfig .err { color: var(--err); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="lesson-meta">
+    <span class="chip">第 9 课</span>
+    <span class="chip">内存管理篇 · §5 内存寻址</span>
+    <span class="chip">覆盖 §5.1 DRAM/MMIO / §5.2.1 寻址 / §5.2.2 内存映射 / §5.3 GPU framebuffer</span>
+    <span class="chip">内存管理篇 · 开篇</span>
+    <span class="chip">Linux 6.6 (你的环境)</span>
+    <a href="../reference/glossary.html">术语表</a>
+  </p>
+
+  <h1>内存寻址:从虚拟地址到物理地址</h1>
+
+  <p>
+    <strong>内存管理篇开篇。</strong>这是驱动开发最硬核、对你价值最高的一篇。你写驱动每次 <code>kzalloc</code>、每次访问设备寄存器、每个 page fault,
+    底层都靠这课讲的机制。先把地基打好:CPU 发出的<strong>虚拟地址</strong>怎么变成<strong>物理地址</strong>?
+    DRAM 和设备内存(MMIO)有什么区别?这是后面 §6 物理内存、§7 虚拟内存、§8 缺页的必备前置。
+  </p>
+
+  <aside class="callout tip">
+    <span class="callout-title">MCU 对照:你熟悉的"地址"在这里变了</span>
+    <p>裸机上你写的地址大多<strong>就是物理地址</strong>(直接指向 RAM 或外设寄存器)。x86/ARM 跑 Linux 时,CPU 发出的<strong>都是虚拟地址</strong>,
+    要经过 <strong>MMU + 页表</strong>翻译才到物理地址。这一层翻译就是本课主角。</p>
+  </aside>
+
+
+  <h2 id="dram-mmio">§5.1 DRAM 与 MMIO:两种"物理内存"</h2>
+
+  <p><strong>关键认知</strong>:物理地址空间不是只有 RAM。它是<strong>统一的一张地址表</strong>,RAM(DRAM)和设备寄存器/显存(MMIO)都映射在里面,由 BIOS/UEFI 的内存表(E820/UEFI)标注各段类型:</p>
+
+  <div class="addrfig">物理地址空间(简化,实际由 BIOS/UEFI 表描述)
+
+  0xFFFF_FFFF_FFFF_FFFF ┌─────────────────────┐
+                        │ ...                  │
+                        │ <span class="hl">MMIO: PCIe 设备 BAR</span>   │  ← GPU 显存、网卡寄存器、PCIe 配置空间
+                        │ ...                  │     这些地址落到设备,不在 DRAM 上!
+  0x0010_0000 ~────────┤                      │
+                        │ <span class="ok">DRAM: 真正的内存条</span>     │  ← 你的 8GB/16GB 物理内存
+                        │ ...                  │
+  0x0000_0000 ──────────┴─────────────────────┘  ← 1MB 以下还有 BIOS 保留区
+
+  <span class="dim">CPU 给一个物理地址 → 总线决定它去 DRAM 还是去设备(MMIO)。</span>
+  <span class="dim">所以"访问 GPU 寄存器"和"访问内存",对 CPU 是同一套 load/store,只是地址段不同。</span></div>
+
+  <div class="mcu-vs-kernel">
+    <div class="col">
+      <h4>DRAM(主存)</h4>
+      <p>真正的内存条。CPU 读写经缓存(L1/L2/L3),可乱序、可聚合。<strong>可缓存(cacheable)</strong>。</p>
+      <p>内核用 <code>kmalloc</code>/<code>alloc_pages</code> 分配的就是这种。</p>
+    </div>
+    <div class="col">
+      <h4>MMIO(内存映射 IO)</h4>
+      <p>设备寄存器/显存,映射进物理地址空间。<strong>绝不能缓存</strong>——每次访问必须真实到达设备,顺序也要严格。</p>
+      <p>驱动必须用 <code>ioremap()</code> 建立<strong>带正确属性(uncached/强序)的映射</strong>,不能当普通指针解引用。</p>
+    </div>
+  </div>
+
+  <aside class="callout warn">
+    <span class="callout-title">为什么 MMIO 不能当 DRAM 访问</span>
+    <p>若 CPU 把设备寄存器地址当 DRAM 缓存:读寄存器可能读到<strong>过期的缓存值</strong>(设备状态变了但 CPU 还看旧的);
+    写寄存器可能<strong>被缓存聚合/乱序</strong>(两条"置位"命令被合成一条,或顺序颠倒)。所以 <code>ioremap</code> 出来的映射标记为 uncached + 强序,
+    且必须用 <code>readl/writel</code>(带屏障的访问函数),不能用裸指针解引用。</p>
+  </aside>
+
+
+  <h2 id="translation">§5.2.1 寻址:MMU + 多级页表</h2>
+
+  <p>CPU 发出虚拟地址(VA),<strong>MMU</strong>(内存管理单元,硬件)负责把它翻译成物理地址(PA)。翻译规则存在<strong>页表</strong>里,页表是进程私有的。</p>
+
+  <h3>页表是一棵"分级树"</h3>
+
+  <p>虚拟地址按固定 bit 位切分成多段,每段作为一级索引去查页表树。x86_64 在 6.x 默认 <strong>5 级页表(LA57)</strong>:</p>
+
+  <div class="addrfig">x86_64 5 级页表(LA57,57 位虚拟地址)
+
+  虚拟地址 57 位:[ 签名扩展 ][ PGD idx | P4D idx | PUD idx | PMD idx | PTE idx | 页内偏移 ]
+                          9      9      9      9      9      12   (bit)
+
+  CR3 ──→ <span class="hl">PGD</span>(每项 512GB)
+            │  按 PGD idx(9 bit)选一项
+            ↓
+           <span class="hl">P4D</span>(每项 512GB → 注:LA57 新增这一层)
+            │
+            ↓
+           <span class="hl">PUD</span>(每项 1GB)
+            │
+            ↓
+           <span class="hl">PMD</span>(每项 2MB)  ← 若大页(2MB),到此为止
+            │
+            ↓
+           <span class="hl">PTE</span>(每项 4KB)  ← 最终页,含物理页帧号 + 权限位
+            │
+            ↓
+         物理地址 + 页内偏移
+
+  <span class="dim">每级 9 bit → 512 项(2^9);页内偏移 12 bit → 4KB 页。</span>
+  <span class="dim">4 级(48 位)时没有 P4D,VA 空间 256TB;5 级(57 位)扩到 128PB。</span></div>
+
+  <table>
+    <thead><tr><th>页表级</th><th>对应英文</th><th>每项覆盖</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>PGD</td><td>Page Global Directory</td><td>512 GB(LA57)</td><td>CR3 指向它,每个进程一份</td></tr>
+      <tr><td>P4D</td><td>Page 4 Directory</td><td>—</td><td><strong>5 级页表新增</strong>,4 级时折叠</td></tr>
+      <tr><td>PUD</td><td>Page Upper Directory</td><td>1 GB</td><td></td></tr>
+      <tr><td>PMD</td><td>Page Middle Directory</td><td>2 MB</td><td>大页(2MB)在这层终止</td></tr>
+      <tr><td>PTE</td><td>Page Table Entry</td><td>4 KB</td><td>最终表项:物理页帧号 + R/W/X 权限位</td></tr>
+    </tbody>
+  </table>
+
+  <aside class="callout">
+    <span class="callout-title">为什么分多级(而不是一张大表)?</span>
+    <p>一张覆盖 57 位空间的扁平页表会大到不可行(2^45 项 × 8 字节 = PB 级)。<strong>多级树让"没用的虚拟地址范围"不占物理内存</strong>——
+    只有实际用到的区域,对应的页表分支才被创建。这是空间换时间的精妙设计。</p>
+  </aside>
+
+  <aside class="callout warn">
+    <span class="callout-title">版本纠偏:4 级还是 5 级?</span>
+    <p>老资料默认讲 4 级(48 位,256TB)。但<strong>6.x 在支持 LA57 的 CPU 上默认启用 5 级</strong>(57 位,128PB),多出 P4D 这一层。
+    你的 WSL2 是 6.6,很可能跑在 5 级模式(取决于底层 CPU)。内核引入 P4D 是为了"4 级/5 级可移植"——
+    在 4 级 CPU 上 P4D 被折叠(相当于一层空操作)。可用 <code>grep la57 /proc/cpuinfo</code> 看 CPU 是否支持。
+    <strong>无论几级,翻译原理一样</strong>——多一级只是多查一次表。</p>
+  </aside>
+
+
+  <h2 id="mmu-tlb">MMU 与 TLB 的协作</h2>
+
+  <p>每次访存都走 5 级树太慢(5 次内存读)。硬件用 <strong>TLB(Translation Lookaside Buffer)</strong> 缓存"VA→PA"翻译结果:</p>
+
+  <div class="addrfig">一次虚拟地址访问的完整流程
+
+  CPU 给出 VA
+     │
+     ↓
+  <span class="hl">TLB 查询</span>(VA 的翻译在不在缓存里?)
+     │
+     ├─ 命中(TLB hit) ──→ 直接拿到 PA,访存(<span class="ok">快,这才是常态</span>)
+     │
+     └─ 未命中(TLB miss)
+            │
+            ↓
+        <span class="err">MMU 硬件页表遍历</span>(page table walk):按 PGD→P4D→PUD→PMD→PTE 逐级读内存
+            │
+            ├─ 找到 PTE,权限检查通过 → 把翻译填进 TLB,再访存
+            └─ PTE 无效/权限不符 → 触发<strong>缺页异常</strong>(第 12 课深讲),交给内核处理
+
+  <span class="dim">TLB 是 CPU 内的硬件缓存,软件不可直接操作,只能"通知刷掉"(如进程切换、改页表时)。</span></div>
+
+  <p><strong>TLB 的命中是性能关键</strong>——miss 要走 5 次内存的页表遍历。所以内核想方设法减少 TLB miss(大页、预取)和 TLB 刷新开销:</p>
+
+  <table>
+    <thead><tr><th>机制</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>PCID</strong>(进程上下文 ID)</td><td>给 TLB 项打进程标签,进程切换时<strong>不必全刷 TLB</strong>(只有相同 PCID 的项才匹配)</td></tr>
+      <tr><td><strong>KPTI</strong>(内核页表隔离)</td><td>Meltdown 缓解:用户态/内核态用不同页表。代价是 CR3 切换变频繁,所以 <strong>PCID 变得更关键</strong></td></tr>
+      <tr><td><strong>大页(hugepage)</strong></td><td>2MB/1GB 页,一个 TLB 项覆盖更大范围,减少 TLB 压力</td></tr>
+    </tbody>
+  </table>
+
+
+  <h2 id="kernel-userspace">内核虚拟地址空间 vs 用户虚拟地址空间</h2>
+
+  <p>每个进程有自己的页表,但<strong>所有进程共享同一份内核地址空间映射</strong>(高地址区段)。x86_64 概览(具体见 §7):</p>
+
+  <div class="addrfig">x86_64 虚拟地址空间划分(简化,§7 详讲)
+
+  高地址 ┌─────────────────────────┐
+         │ <span class="hl">内核空间</span>(直接映射区/VMALLOC/FIXMAP...)│  ← 所有进程共享,高半区
+         │                          │     进程切换时这部分页表不变
+  ───────┤──────────────────────────┤  ← 不可访问的空洞(隔离用户与内核)
+         │                          │
+         │ <span class="ok">用户空间</span>(代码/数据/堆/mmap/栈)      │  ← 每个进程私有
+  低地址 └─────────────────────────┘</div>
+
+  <p>关键:<strong>内核代码访问的虚拟地址,要么在"内核空间"直接映射区,要么是 vmalloc/ioremap 动态映射的</strong>。
+  驱动里 <code>kmalloc</code> 返回的地址在直接映射区,<code>ioremap</code> 返回的在 VMALLOC 区。</p>
+
+
+  <h2 id="ioremap">§5.2.2 + §5.3 内存映射与 ioremap(GPU framebuffer 案例)</h2>
+
+  <p>把上面的机制串起来——一个真实驱动场景:访问 GPU 的 framebuffer。</p>
+
+  <ol class="steps">
+    <li>GPU 通过 PCIe 暴露一段 BAR(Base Address Register),映射进<strong>物理地址空间的 MMIO 区</strong>(不是 DRAM)。</li>
+    <li>内核启动时从 BIOS/ACPI 知道这段物理地址范围。</li>
+    <li>驱动调 <code>ioremap(phys, size)</code> → 内核在<strong>内核虚拟地址空间</strong>建立一段映射,属性 uncached + 强序。</li>
+    <li>驱动拿这个<strong>虚拟地址</strong>,用 <code>readl/writel/iowrite32</code> 访问 → CPU 经 MMU 翻译 → 到达物理 MMIO 地址 → 总线转发给 GPU。</li>
+  </ol>
+
+  <pre><code><span class="com">// 驱动访问 MMIO 寄存器的标准模式</span>
+<span class="type">void</span> __iomem *regs = ioremap(pci_resource_start(pdev, <span class="str">0</span>),   <span class="com">// 物理 MMIO 地址</span>
+                              pci_resource_len(pdev, <span class="str">0</span>));
+<span class="kw">if</span> (!regs) <span class="kw">return</span> -ENOMEM;
+
+u32 ctrl = <span class="kw">readl</span>(regs + CTRL_REG);     <span class="com">// 读寄存器(带屏障,不缓存)</span>
+<span class="kw">writel</span>(ctrl | ENABLE, regs + CTRL_REG); <span class="com">// 写寄存器</span>
+
+iounmap(regs);                            <span class="com">// 释放映射</span></code></pre>
+
+  <aside class="callout warn">
+    <span class="callout-title">常见错误(面试常考)</span>
+    <p><strong>不要</strong>把 <code>ioremap</code> 的返回值当普通指针解引用(<code>*regs</code> 或 <code>regs[0]</code>)——
+    它是 <code>__iomem</code> 地址,属性与 DRAM 不同,裸解引用会被 Sparse 检查器警告,且行为不可预测。
+    必须用 <code>readl/writel/ioread32/iowrite32</code> 等显式 IO 访问函数。</p>
+  </aside>
+
+
+  <h2 id="lab">动手实验:看自己的页表与 CR3(WSL2 可跑)</h2>
+
+  <p>
+    内存寻址的硬件细节不能直接"写实验"测(MMU/TLB 是硬件),但你可以<strong>从内核和 /proc 观察页表的真实存在</strong>。
+    这实验纯观察,WSL2 完全可跑。
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">先声明:这实验在测什么</span>
+    <p>不是测性能,而是<strong>验证"页表真实存在、每进程独立、CR3 指向它"</strong>。你将看到自己的 bash 进程的页表基址、虚拟地址映射。
+    根据 LR-0012 规则:本实验不涉及"锁/竞争/性能",是观察性的。</p>
+  </aside>
+
+  <ol class="steps">
+    <li>
+      看你的 CPU 是否支持 LA57(5 级页表):
+      <pre style="margin:.5rem 0;"><code>grep la57 /proc/cpuinfo | head -1
+<span class="com"># 有输出 = 支持 5 级;无输出 = 4 级</span></code></pre>
+    </li>
+    <li>
+      看当前进程(bash)的页表基址 CR3。内核把每个进程的 CR3 值(实际是 mm_struct 的 pgd)暴露在 /proc:
+      <pre style="margin:.5rem 0;"><code>cat /proc/self/pagetable 2>/dev/null | head
+<span class="com"># 或更直接,看 mm 的 pgd(需要 root 或内核 5.x+ 的 /proc/self/status)</span>
+grep -i pgd /proc/self/status 2>/dev/null</code></pre>
+    </li>
+    <li>
+      看一段虚拟地址的实际映射(以 bash 自身的代码段为例):
+      <pre style="margin:.5rem 0;"><code>cat /proc/self/maps | head -3
+<span class="com"># 输出形如:559c1a2b0000-559c1a2b3000 r--p ... /bin/bash
+# 这是虚拟地址范围,后面权限 r--p 表示只读+私有</span></code></pre>
+    </li>
+    <li>
+      打开两个 bash(A 和 B),分别 <code>cat /proc/self/maps | head -1</code> ——
+      你会发现<strong>两个进程的虚拟地址可以相同</strong>(都是 0x559c... 开头),
+      但它们映射到<strong>不同物理页</strong>。这就是"虚拟地址空间每进程独立、靠各自页表翻译"的可观察证据。
+    </li>
+  </ol>
+
+  <aside class="callout tip">
+    <span class="callout-title">观察重点</span>
+    <p><strong>不同进程的相同虚拟地址,映射到不同物理页</strong>——这正是"每进程一份页表"的直接证据。同一虚拟地址在 A 的页表里指向物理页 X,
+    在 B 的页表里指向物理页 Y。翻译完全由各自的页表(CR3)决定。这就是为什么进程间内存隔离能成立。</p>
+  </aside>
+
+
+  <h2 id="check">检验理解</h2>
+
+  <div class="quiz" data-correct="b" data-explain="CPU 发出的都是虚拟地址,必须经 MMU 查页表翻译成物理地址。DRAM 和 MMIO 共享同一个物理地址空间,由 BIOS/UEFI 内存表标注类型区分,不是两套独立空间。'物理地址唯一寻 DRAM'错(还有 MMIO);'MMIO 可缓存'错(必须 uncached,否则读到陈旧值/写被聚合乱序)。">
+    <p class="quiz-q">关于 DRAM 与 MMIO,哪个说法是对的?</p>
+    <label class="quiz-opt"><input type="radio" name="q1" value="a">两者是两套独立的物理地址空间</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="b">共享统一物理地址空间,由内存表区分</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="c">物理地址唯一寻 DRAM</label>
+    <label class="quiz-opt"><input type="radio" name="q1" value="d">MMIO 可以和 DRAM 一样缓存</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+  <div class="quiz" data-correct="c" data-explain="多级页表的核心动机是节省空间:实际用到的虚拟地址范围才有对应的页表分支被创建,没用的范围不占物理内存。一张覆盖 57 位空间的扁平表会大到 PB 级不可行。'多级更快''减少 TLB miss''支持更多权限'都不是主因;多级本身因多几次访存反而略慢,TLB miss 还会增加。">
+    <p class="quiz-q">为什么内核用多级页表,而不是一张扁平大表?</p>
+    <label class="quiz-opt"><input type="radio" name="q2" value="a">多级页表查询更快</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="b">减少 TLB miss</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="c">没用的地址范围不占物理内存</label>
+    <label class="quiz-opt"><input type="radio" name="q2" value="d">支持更多权限位</label>
+    <button class="quiz-check" type="button">提交</button>
+  </div>
+
+
+  <h2 id="next">接下来</h2>
+
+  <p>
+    这课建立了"虚拟地址 → 物理地址"的翻译模型:MMU + 多级页表 + TLB,以及 DRAM 与 MMIO 的区别、<code>ioremap</code> 的作用。
+    下一课(§6)讲<strong>物理内存怎么管理</strong>——内核怎么知道哪些物理页空闲?怎么分配/回收?
+    引入<strong>伙伴系统(buddy system)</strong>,以及物理内存的 node/zone 划分。这是 <code>alloc_pages</code>/<code>__get_free_pages</code> 背后的机制。
+  </p>
+
+  <aside class="callout">
+    <span class="callout-title">推荐精读</span>
+    <ul style="margin-bottom:0">
+      <li>官方:<a href="https://docs.kernel.org/mm/page_tables.html" target="_blank" rel="noopener">Page Tables</a>(页表层级权威)、<a href="https://docs.kernel.org/x86/x86_64/5level-paging.html" target="_blank" rel="noopener">x86_64 5-level paging</a></li>
+      <li>LWN 必读:<a href="https://lwn.net/Articles/717293/" target="_blank" rel="noopener">Five-level page tables</a>(LA57 来历)、<a href="https://lwn.net/Articles/698014/" target="_blank" rel="noopener">Semantics of MMIO mapping attributes</a></li>
+      <li>内核 internals:<a href="https://kernel-internals.org/mm/tlb-optimization/" target="_blank" rel="noopener">TLB Optimization</a>(PCID/KPTI)</li>
+      <li>本书 §5「内存寻址」,图解分页与内存映射</li>
+    </ul>
+  </aside>
+
+  <h3>带着这些问题进入第 10 课(物理内存管理)</h3>
+  <ul>
+    <li><strong>内核怎么知道物理内存有多少、哪些空闲?</strong>——E820/UEFI + memblock + 伙伴系统。</li>
+    <li><strong>你调 <code>alloc_pages</code> 时,内核怎么找到一页空闲物理内存?</strong>——伙伴系统按 2 的幂分组。</li>
+    <li><strong>为什么物理内存要分 zone(DMA/NORMAL/HIGH)?</strong></li>
+  </ul>
+
+  <p class="lesson-nav">
+    <a href="0008-rcu.html">← 第 8 课:RCU</a>
+    <a href="#">第 10 课:物理内存管理(待生成)→</a>
+  </p>
+
+  <hr>
+  <p style="font-family:var(--sans);font-size:.85rem;color:var(--ink-mute);">
+    实验做完后告诉我:你的 CPU 支不支持 LA57?两个 bash 的相同虚拟地址映射到不同物理页,看清了吗?
+    页表层级(4 vs 5)和 ioremap 的原理清楚后,说"继续"进第 10 课(伙伴系统)。
+  </p>
+
+</div>
+</body>
+</html>

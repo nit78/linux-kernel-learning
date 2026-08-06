@@ -55,7 +55,7 @@
   <h1>术语表（Glossary）</h1>
   <p class="lesson-meta">
     <span class="chip">随课程扩充</span>
-    <span class="chip">已收录 50 条</span>
+    <span class="chip">已收录 58 条</span>
     <a href="../lessons/0001-intrusive-list-head.html">← 回到第 1 课</a>
   </p>
   <p class="glossary-intro">
@@ -480,6 +480,58 @@
       RCU 的核心概念：所有 CPU 都至少经过一次<strong>静止状态</strong>（quiescent state，如上下文切换、idle、用户态返回）的时间窗。
       经过静止状态意味着该核退出了之前开始的任何 RCU 读临界区。<code>synchronize_rcu()</code> 阻塞等一个宽限期，
       返回后即可安全释放旧数据（所有持旧指针的读者都已退出）。代价是写者延迟（毫秒级），故 RCU 不适合频繁写。
+    </dd>
+  </dl>
+
+  <p class="group-label">内存寻址（第 9 课）</p>
+
+  <dl class="gloss">
+    <dt>MMU <span class="en">Memory Management Unit</span></dt>
+    <dd>
+      CPU 内的硬件单元，负责把 CPU 发出的<strong>虚拟地址</strong>翻译成<strong>物理地址</strong>。翻译规则由<strong>页表</strong>定义（进程私有）。
+      MMU 在 TLB miss 时自动做<strong>硬件页表遍历</strong>（page table walk）。
+    </dd>
+
+    <dt>虚拟地址 / 物理地址 <span class="en">virtual address / physical address</span></dt>
+    <dd>
+      <strong>虚拟地址（VA）</strong>：CPU 指令发出的地址，每进程独立空间。
+      <strong>物理地址（PA）</strong>：实际访问内存条或设备的地址，全局唯一。
+      VA 经 MMU+页表翻译成 PA。MCU 裸机常 VA=PA（无 MMU 或直映射），Linux 永远走翻译。
+    </dd>
+
+    <dt>多级页表 <span class="en">multi-level page table</span></dt>
+    <dd>
+      把虚拟地址按 bit 分段，分段索引一棵分级树（PGD→P4D→PUD→PMD→PTE）。
+      x86_64 6.x 默认 <strong>5 级（LA57，57 位 VA）</strong>；老的 4 级（48 位，256TB）。
+      <strong>P4D 是 5 级新增层</strong>，4 级 CPU 上被折叠。最终 PTE 含物理页帧号 + R/W/X 权限位。
+      动机：<strong>让没用的 VA 范围不占物理内存</strong>（扁平表会大到 PB 级）。
+    </dd>
+
+    <dt>TLB <span class="en">Translation Lookaside Buffer</span></dt>
+    <dd>
+      CPU 内的硬件缓存，缓存"VA→PA"翻译结果。TLB hit 直接拿到 PA（快，常态）；TLB miss 触发 MMU 硬件页表遍历（5 次内存读，慢）。
+      软件不可直接操作 TLB，只能通知刷新（如进程切换改 CR3、改页表时）。
+      <strong>PCID</strong> 给 TLB 项打进程标签，进程切换时不必全刷；<strong>KPTI</strong>（Meltdown 缓解）使 CR3 切换更频繁，PCID 因此更关键。
+    </dd>
+
+    <dt>DRAM <span class="en">DRAM — main memory</span></dt>
+    <dd>
+      物理内存条。可缓存（cacheable）、可乱序聚合。<code>kmalloc</code>/<code>alloc_pages</code> 分配的是这种。
+      与 MMIO 共享<strong>统一物理地址空间</strong>，由 BIOS/UEFI 内存表（E820/UEFI）标注类型区分。
+    </dd>
+
+    <dt>MMIO <span class="en">Memory-Mapped I/O</span></dt>
+    <dd>
+      设备寄存器/显存映射进物理地址空间（如 GPU 的 PCIe BAR）。<strong>绝不能缓存</strong>——读写必须真实到达设备、顺序严格。
+      驱动用 <code>ioremap(phys, size)</code> 建立 uncached + 强序的内核虚拟映射，用 <code>readl/writel/ioread32/iowrite32</code> 访问。
+      <span class="avoid">不能当 DRAM 指针裸解引用；不能用 /dev/mem 绕过（受 CONFIG_STRICT_DEVMEM 限制）。</span>
+    </dd>
+
+    <dt>ioremap <span class="en">ioremap()</span></dt>
+    <dd>
+      内核 API：把物理 MMIO 地址区间映射成内核虚拟地址（属性 uncached + 强序），返回 <code>void __iomem *</code>。
+      驱动访问设备寄存器的标准入口。必须配对 <code>iounmap</code> 释放。
+      <span class="avoid">返回值不可当普通指针解引用，必须用 readl/writel 等 IO 访问函数。</span>
     </dd>
   </dl>
 
